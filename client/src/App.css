@@ -1,0 +1,402 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica,
+    Arial, sans-serif;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid #30363d;
+}
+
+.app-header h1 {
+  font-size: 16px;
+  margin: 0;
+  font-weight: 600;
+}
+
+.app-header .subtitle {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.heatmap-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+/* deck.gl canvas fills the wrap */
+.heatmap-wrap canvas {
+  display: block;
+}
+
+.loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.loading pre {
+  color: #f85149;
+  background: #1f1f1f;
+  padding: 12px;
+  border-radius: 6px;
+  max-width: 600px;
+  overflow: auto;
+}
+
+/* Legend (colour bar) */
+.legend {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  background: rgba(22, 27, 34, 0.85);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text);
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
+.legend-title {
+  margin-bottom: 6px;
+  color: var(--muted);
+}
+
+.legend-bar {
+  display: flex;
+  height: 12px;
+  width: 180px;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.legend-swatch {
+  flex: 1;
+}
+
+.legend-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Info panel */
+.info {
+  position: absolute;
+  right: 16px;
+  top: 16px;
+  background: rgba(22, 27, 34, 0.85);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.6;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
+.info strong {
+  color: var(--accent);
+}
+
+/* Hover tooltip */
+.tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 10;
+  background: rgba(13, 17, 23, 0.92);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.7;
+  white-space: nowrap;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.tooltip .tt-label {
+  color: var(--muted);
+  display: inline-block;
+  width: 72px;
+}
+
+/* ---------------------------------------------------------------- */
+/* Gene selection toolbar                                            */
+/* ---------------------------------------------------------------- */
+
+.gene-toolbar {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(22, 27, 34, 0.85);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 8px 10px;
+  backdrop-filter: blur(4px);
+}
+
+.gt-btn {
+  background: var(--accent);
+  color: #0d1117;
+  border: none;
+  border-radius: 4px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.gt-btn:hover {
+  opacity: 0.85;
+}
+
+.gt-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.gt-reset {
+  background: #30363d;
+  color: var(--text);
+}
+
+.gt-badge {
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+  padding: 2px 6px;
+  background: rgba(88, 166, 255, 0.12);
+  border-radius: 4px;
+}
+
+.custom-error {
+  position: absolute;
+  left: 50%;
+  top: 60px;
+  transform: translateX(-50%);
+  z-index: 30;
+  background: rgba(248, 81, 73, 0.15);
+  border: 1px solid #f85149;
+  color: #f85149;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.info-custom {
+  color: var(--accent);
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+/* ---------------------------------------------------------------- */
+/* Gene picker panel                                                 */
+/* ---------------------------------------------------------------- */
+
+.gene-picker {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 50;
+  width: 460px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.gp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #30363d;
+}
+
+.gp-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.gp-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.gp-close:hover {
+  background: #30363d;
+  color: var(--text);
+}
+
+.gp-search {
+  padding: 10px 16px;
+  border-bottom: 1px solid #30363d;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gp-search input {
+  flex: 1;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.gp-search input:focus {
+  border-color: var(--accent);
+}
+
+.gp-count {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.gp-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 300px;
+  max-height: 50vh;
+  background: #0d1117;
+}
+
+.gp-row {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  width: 100%;
+  padding: 0 16px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+}
+
+.gp-row:hover {
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.gp-row input[type='checkbox'] {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.gp-gene-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gp-gene-idx {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.gp-actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid #30363d;
+}
+
+.gp-btn {
+  flex: 1;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.gp-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.gp-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.gp-clear {
+  background: #30363d;
+  color: var(--text);
+}
+
+.gp-apply {
+  background: var(--accent);
+  color: #0d1117;
+}

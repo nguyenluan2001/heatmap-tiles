@@ -1,127 +1,204 @@
-import { BitmapLayer } from '@deck.gl/layers'
+import { Texture } from "@luma.gl/core";
+import { SolidPolygonLayer } from "@deck.gl/layers";
 
-import { tileUrl } from './api'
-import type { PyramidMeta } from './api'
+import { GroupedHeatmapLayer } from "./GroupedHeatmapLayer";
+import { SpatialLayout } from "./SpatialLayout";
+import { tileUrl } from "./api";
+import type { PyramidMeta } from "./api";
+
+/** App background colour (matches --bg in App.css) used to mask gap regions. */
+const GAP_MASK_COLOR: [number, number, number, number] = [13, 17, 23, 255];
 
 /** Function that builds a tile PNG URL from (level, row, col). */
-export type TileUrlFn = (level: number, row: number, col: number) => string
+export type TileUrlFn = (level: number, row: number, col: number) => string;
 
 /** A single visible tile with its world-space bounds (4 corners). */
 export interface VisibleTile {
-    level: number
-    row: number
-    col: number
-    bounds: [[number, number], [number, number], [number, number], [number, number]]
+  level: number;
+  row: number;
+  col: number;
+  bounds: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ];
 }
 
 /**
  * Compute which tiles are visible in the current viewport and which pyramid
- * level best matches the zoom.
+ * level best matches the zoom, applying cluster-gap offsets via the layout.
  *
- * World coordinate system: the matrix occupies [0, n_genes] × [0, n_cells]
- * (y increases downward). At viewport zoom z, 1 world unit = 2^z pixels, so
- * the visible world span is (viewportSize / 2^z).
+ * World coordinate system: the matrix occupies [0, n_cells] × [0, n_genes]
+ * (X = cells, Y = genes, y increases downward), with cluster gaps inserted
+ * along the X-axis by the {@link SpatialLayout}. At viewport zoom z, 1 world
+ * unit = 2^z pixels, so the visible world span is (viewportSize / 2^z).
  *
  * Level selection: at level L the matrix is downsampled by 2^L, so one
  * level-L cell spans 2^L world units = 2^(z+L) screen pixels. We want ~1
  * screen pixel per cell, i.e. z + L ≈ 0  =>  L ≈ -z (clamped to [0, maxLevel]).
+ *
+ * Per Rule #3 (No Matrix Padding Expansion), edge tiles retain standard full
+ * bounds coordinates to avoid pixel distortion and aspect-ratio skewing.
  */
 export function computeVisibleTiles(
-    meta: PyramidMeta,
-    target: [number, number, number],
-    zoom: number,
-    width: number,
-    height: number,
+  meta: PyramidMeta,
+  target: [number, number, number],
+  zoom: number,
+  width: number,
+  height: number,
+  layout?: SpatialLayout,
 ): VisibleTile[] {
-    const { n_genes: W, n_cells: H, tile_size: TILE, levels, n_levels } = meta
-    const maxLevel = n_levels - 1
+  const { tile_size: TILE, levels, n_levels } = meta;
+  const maxLevel = n_levels - 1;
 
-    // Visible world rectangle (clamped to the matrix bounds).
-    const visW = width / Math.pow(2, zoom)
-    const visH = height / Math.pow(2, zoom)
-    const west = target[0] - visW / 2
-    const east = target[0] + visW / 2
-    const north = target[1] - visH / 2
-    const south = target[1] + visH / 2
+  // Visible world rectangle (clamped to the matrix bounds).
+  const visW = width / Math.pow(2, zoom);
+  const visH = height / Math.pow(2, zoom);
+  const west = target[0] - visW / 2;
+  const east = target[0] + visW / 2;
+  const north = target[1] - visH / 2;
+  const south = target[1] + visH / 2;
 
-    // Pick the pyramid level for this zoom. We floor (not round) so we prefer
-    // finer levels — a slightly-too-fine tile downscaled by the GPU with
-    // nearest filtering stays crisp, whereas a coarser tile looks blurry.
-    let level = Math.floor(-zoom)
-    level = Math.max(0, Math.min(maxLevel, level))
+  // Pick the pyramid level for this zoom. We floor (not round) so we prefer
+  // finer levels — a slightly-too-fine tile downscaled by the GPU with
+  // nearest filtering stays crisp, whereas a coarser tile looks blurry.
+  let level = Math.floor(-zoom);
+  level = Math.max(0, Math.min(maxLevel, level));
 
-    const [h, w] = levels[level]
-    const nRows = Math.ceil(h / TILE)
-    const nCols = Math.ceil(w / TILE)
+  const [h, w] = levels[level];
+  const nRows = Math.ceil(h / TILE);
+  const nCols = Math.ceil(w / TILE);
 
-    // World size of one tile at this level. At level 0, 1 cell = 1 world
-    // unit, so a tile spans TILE world units. Each level halves the
-    // resolution, so at level L a tile spans TILE * 2^L world units.
-    const downsample = Math.pow(2, level)
-    const tileWorldW = TILE * downsample
-    const tileWorldH = TILE * downsample
+  // World size of one tile at this level. At level 0, 1 cell = 1 world
+  // unit, so a tile spans TILE world units. Each level halves the
+  // resolution, so at level L a tile spans TILE * 2^L world units.
+  const downsample = Math.pow(2, level);
+  const tileWorldW = TILE * downsample;
+  const tileWorldH = TILE * downsample;
 
-    // Visible tile index range (clamped to valid tiles). Add a +2 buffer
-    // on both edges so partially-visible tiles are always included. This
-    // accounts for float rounding and tiles that are just off-screen.
-    const minCol = Math.max(0, Math.floor(west / tileWorldW) - 1)
-    const maxCol = Math.min(nCols - 1, Math.floor(east / tileWorldW) + 2)
-    const minRow = Math.max(0, Math.floor(north / tileWorldH) - 1)
-    const maxRow = Math.min(nRows - 1, Math.floor(south / tileWorldH) + 2)
-
-    const tiles: VisibleTile[] = []
-    for (let r = minRow; r <= maxRow; r++) {
-        for (let c = minCol; c <= maxCol; c++) {
-            // Use the FULL tile bounds (not clamped to matrix). The PNG is
-            // NaN-padded beyond the data, so the transparent padding renders
-            // harmlessly outside the matrix. This ensures the data pixels
-            // map 1:1 to their correct world positions (e.g. row 10's 78
-            // data cells map to the top 78/256 of the tile, not stretched
-            // across the whole 78-unit clamped region).
-            const x0 = c * tileWorldW
-            const y0 = r * tileWorldH
-            const x1 = (c + 1) * tileWorldW
-            const y1 = (r + 1) * tileWorldH
-            tiles.push({
-                level,
-                row: r,
-                col: c,
-                // 4-corner bounds: [topLeft, topRight, bottomRight, bottomLeft]
-                bounds: [
-                    [x0, y0],
-                    [x1, y0],
-                    [x1, y1],
-                    [x0, y1],
-                ],
-            })
-        }
+  // Visible tile index range. Rather than converting gap-included world
+  // bounds back to raw indices (fragile and the root cause of interleaved
+  // missing tiles), we iterate ALL tiles at the selected level and keep
+  // only those whose world bounds intersect the viewport rectangle. This
+  // is O(nRows * nCols) — cheap for this matrix size — and guarantees no
+  // tile is wrongly culled by index-arithmetic mismatches.
+  //
+  // The reject margin is a few tile widths so partially-visible edge
+  // tiles are always included even when the viewport fit is slightly off
+  // or cluster gaps stretch the world span.
+  const marginX = tileWorldW * 3;
+  const marginY = tileWorldH * 3;
+  const tiles: VisibleTile[] = [];
+  for (let r = 0; r < nRows; r++) {
+    const y0 = r * tileWorldH;
+    const y1 = (r + 1) * tileWorldH;
+    // Quick Y reject: skip rows entirely above/below the viewport.
+    if (y1 < north - marginY || y0 > south + marginY) continue;
+    for (let c = 0; c < nCols; c++) {
+      // X bounds: apply the SpatialLayout gap offset map so tiles are
+      // positioned with cluster gaps. When no layout is provided (gap=0),
+      // this reduces to the plain tile bounds.
+      const startCol = c * TILE * downsample;
+      const endCol = (c + 1) * TILE * downsample;
+      const x0 = layout ? layout.mapColToWorldX(startCol) : c * tileWorldW;
+      const x1 = layout ? layout.mapColToWorldX(endCol) : (c + 1) * tileWorldW;
+      // Quick X reject: skip tiles entirely left/right of the viewport.
+      if (x1 < west - marginX || x0 > east + marginX) continue;
+      tiles.push({
+        level,
+        row: r,
+        col: c,
+        // 4-corner bounds: [topLeft, topRight, bottomRight, bottomLeft]
+        bounds: [
+          [x0, y0],
+          [x1, y0],
+          [x1, y1],
+          [x0, y1],
+        ],
+      });
     }
-    return tiles
+  }
+  return tiles;
 }
 
 /**
- * Build an array of BitmapLayers, one per visible tile. We preload each
- * tile PNG as an HTMLImageElement and pass it to BitmapLayer, which is more
- * reliable than passing a URL string (which depends on deck.gl's async
- * image prop handling).
+ * Build an array of GroupedHeatmapLayers, one per visible tile. Each layer
+ * loads its grayscale PNG tile and maps it through the shared colour LUT
+ * texture on the GPU. The LUT texture is shared across all tiles so palette
+ * switching is instant.
  */
 export function createTileLayers(
-    tiles: VisibleTile[],
-    urlFn: TileUrlFn = tileUrl,
-    idPrefix = 'tile',
+  tiles: VisibleTile[],
+  colorMapLUT: Texture,
+  urlFn: TileUrlFn = tileUrl,
+  idPrefix = "tile",
 ) {
-    return tiles.map(
-        (t) =>
-            new BitmapLayer({
-                id: `${idPrefix}-${t.level}-${t.row}-${t.col}`,
-                image: urlFn(t.level, t.row, t.col),
-                bounds: t.bounds,
-                // Nearest filtering keeps each cell-gene a crisp square instead
-                // of blurring neighbours together.
-                textureParameters: {
-                    minFilter: 'nearest',
-                    magFilter: 'nearest',
-                },
-            }),
-    )
+  return tiles.map((t) => {
+    // `colorMapLUT` is a custom prop on GroupedHeatmapLayer; cast the props
+    // object so TypeScript accepts the extended property set.
+    const props = {
+      id: `${idPrefix}-${t.level}-${t.row}-${t.col}`,
+      image: urlFn(t.level, t.row, t.col),
+      bounds: t.bounds,
+      colorMapLUT,
+      // Nearest filtering keeps each cell-gene a crisp square instead
+      // of blurring neighbours together.
+      textureParameters: {
+        minFilter: "nearest",
+        magFilter: "nearest",
+      },
+    } as any;
+    return new GroupedHeatmapLayer(props);
+  });
+}
+
+/**
+ * Build solid-colour mask rectangles that cover the inter-cluster gap regions
+ * (and the trailing space after the last cluster) so the heatmap appears
+ * cleanly split into clusters.
+ *
+ * Tiles are static pre-rendered PNGs (Rule #1) and are linearly stretched
+ * across their world-X bounds, so a tile that straddles a cluster boundary
+ * would otherwise bleed content across the gap. These opaque polygons are
+ * drawn ON TOP of the tiles in the exact gap spans to hide that bleed,
+ * producing clean empty separators that line up with the cluster
+ * annotations.
+ *
+ * Returns an empty array when there is no layout or the gap size is 0.
+ */
+export function createGapOverlayLayers(
+  meta: PyramidMeta,
+  layout: SpatialLayout | undefined,
+) {
+  if (!layout || layout.gapSize <= 0 || layout.nGroups <= 0) return [];
+  const h = meta.n_genes;
+  // One rectangle per inter-cluster gap. Each gap spans
+  // [groupEnd_world, groupEnd_world + gapSize] in X, full height in Y.
+  const polygons: [number, number][][] = [];
+  for (let i = 0; i < layout.nGroups - 1; i++) {
+    const rawStart = layout.groupRawStarts[i];
+    const rawEnd = rawStart + layout.groups[i].size;
+    const x0 = layout.mapColToWorldX(rawEnd - 1) + 1;
+    const x1 = x0 + layout.gapSize;
+    polygons.push([
+      [x0, 0],
+      [x1, 0],
+      [x1, h],
+      [x0, h],
+    ]);
+  }
+  if (!polygons.length) return [];
+  return [
+    new SolidPolygonLayer({
+      id: "cluster-gap-mask",
+      data: polygons,
+      getPolygon: (d: [number, number][]) => d,
+      getFillColor: GAP_MASK_COLOR,
+      pickable: false,
+      // Drawn above tiles but below annotations/picking.
+      // deck.gl draws layers in array order; the caller places this between
+      // the tile layers and the annotation layers.
+    } as any),
+  ];
 }

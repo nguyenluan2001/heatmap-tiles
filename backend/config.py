@@ -3,6 +3,7 @@
 All paths are resolved relative to the project root so the package can be
 imported regardless of the current working directory.
 """
+
 from __future__ import annotations
 
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 DATA_DIR = BASE_DIR / "data"
-H5AD_PATH = Path(os.environ.get("HEATMAP_H5AD", DATA_DIR / "TBD_AnnData.h5ad"))
+H5AD_PATH = Path(os.environ.get("HEATMAP_H5AD", DATA_DIR / "TBD_Anndata.h5ad"))
 ZARR_PATH = Path(os.environ.get("HEATMAP_ZARR", DATA_DIR / "heatmap.zarr"))
 
 # Edge length (in cells/genes) of a single square tile at every pyramid level.

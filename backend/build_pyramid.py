@@ -12,6 +12,7 @@ Pipeline
 The resulting zarr store is self-describing: the FastAPI server reads
 ``meta.json`` and the ``level_{L}`` arrays to serve tiles.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,7 +29,11 @@ from .config import H5AD_PATH, LAYER_KEY, TILE_SIZE, ZARR_PATH
 
 
 def _load_matrix(adata, layer_key: str) -> tuple[np.ndarray, str]:
-    """Return a dense ``(n_cells, n_genes)`` float32 matrix and the key used."""
+    """Return a dense ``(n_genes, n_cells)`` float32 matrix and the key used.
+
+    The matrix is transposed so that genes are rows (Y axis) and cells are
+    columns (X axis), matching the heatmap orientation: X = cells, Y = genes.
+    """
     if layer_key and layer_key in adata.layers:
         mat = adata.layers[layer_key]
         key = layer_key
@@ -38,18 +43,34 @@ def _load_matrix(adata, layer_key: str) -> tuple[np.ndarray, str]:
     # Sparse CSR -> dense. 2638 x 32310 float32 ~= 340 MB, fits in RAM.
     if hasattr(mat, "toarray"):
         mat = mat.toarray()
-    return np.asarray(mat, dtype=np.float32), key
+    # Transpose: (n_cells, n_genes) -> (n_genes, n_cells).
+    return np.asarray(mat, dtype=np.float32).T, key
 
 
 def _cluster_order(adata) -> np.ndarray:
-    """Return a permutation of cell indices sorted by the first categorical
-    obs column (preferring ``louvain``). Falls back to identity ordering."""
+    """Return a permutation of cell indices grouped by cluster, with clusters
+    ordered by descending size (largest cluster first).
+
+    Prefers the ``louvain`` obs column (then a couple of fallbacks). Within a
+    cluster the original cell order is preserved (stable sort). Falls back to
+    identity ordering when no cluster column is found.
+    """
     obs = adata.obs
     for col in ("louvain", "Louvain clustering (resolution=5.0)", "m1"):
         if col in obs.columns:
-            codes = obs[col].astype("category").cat.codes.to_numpy()
-            # Stable sort: keeps original order within a cluster.
-            return np.argsort(codes, kind="stable")
+            labels = obs[col].astype(str).to_numpy()
+            # Count cells per cluster label.
+            unique, inverse, counts = np.unique(labels, return_inverse=True, return_counts=True)
+            # Rank clusters by descending size (largest first). Ties keep the
+            # original label order (stable).
+            cluster_rank = np.argsort(-counts, kind="stable")
+            # Map each cluster label -> its descending-size rank.
+            label_to_rank = np.empty(len(unique), dtype=np.int64)
+            label_to_rank[cluster_rank] = np.arange(len(unique))
+            rank_per_cell = label_to_rank[inverse]
+            # Stable sort by rank: cells of the largest cluster come first,
+            # and within a cluster the original order is kept.
+            return np.argsort(rank_per_cell, kind="stable")
     return np.arange(adata.n_obs)
 
 
@@ -63,9 +84,13 @@ def _coarsen_mean(arr: da.Array, factor: int = 2) -> da.Array:
     return da.coarsen(np.nanmean, arr, {0: factor, 1: factor}, trim_excess=False)
 
 
-def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
-          layer_key: str = LAYER_KEY, tile_size: int = TILE_SIZE,
-          overwrite: bool = True) -> dict:
+def build(
+    h5ad_path: Path = H5AD_PATH,
+    zarr_path: Path = ZARR_PATH,
+    layer_key: str = LAYER_KEY,
+    tile_size: int = TILE_SIZE,
+    overwrite: bool = True,
+) -> dict:
     print(f"[build] reading {h5ad_path}")
     adata = read_h5ad(h5ad_path)
     n_cells, n_genes = adata.n_obs, adata.n_vars
@@ -75,7 +100,8 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
     print(f"[build] using layer '{used_key}'")
 
     order = _cluster_order(adata)
-    mat = mat[order]
+    # Reorder cells (now columns after transpose) by cluster.
+    mat = mat[:, order]
 
     # Replace any non-finite values with 0 so pooling is well-defined.
     mat = np.where(np.isfinite(mat), mat, 0.0).astype(np.float32)
@@ -92,8 +118,9 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
     level0 = da.from_array(mat, chunks=(tile_size, tile_size))
 
     # Determine how many levels we need: keep halving until both dims <= tile.
+    # Matrix is transposed: (n_genes, n_cells) -> h=n_genes, w=n_cells.
     max_level = 0
-    h, w = n_cells, n_genes
+    h, w = n_genes, n_cells
     while h > tile_size or w > tile_size:
         h = h // 2
         w = w // 2
@@ -104,6 +131,7 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
     # Fresh zarr store.
     if zarr_path.exists() and overwrite:
         import shutil
+
         shutil.rmtree(zarr_path)
     store = zarr.DirectoryStore(str(zarr_path))
     root = zarr.group(store=store, overwrite=True)
@@ -114,8 +142,11 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
         h_l, w_l = current.shape
         chunks = (min(tile_size, h_l), min(tile_size, w_l))
         z = root.zeros(
-            f"level_{level}", shape=(h_l, w_l), chunks=chunks,
-            dtype="f4", overwrite=True,
+            f"level_{level}",
+            shape=(h_l, w_l),
+            chunks=chunks,
+            dtype="f4",
+            overwrite=True,
         )
         # Write chunk-by-chunk to keep memory bounded.
         current.to_zarr(z.store, component=z.path, overwrite=True)
@@ -127,9 +158,11 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
     obs = adata.obs.iloc[order]
     cell_ids = obs.index.astype(str).to_numpy()
     louvain = None
+    louvain_col = None
     for col in ("louvain", "Louvain clustering (resolution=5.0)", "m1"):
         if col in obs.columns:
             louvain = obs[col].astype(str).to_numpy()
+            louvain_col = col
             break
     umap = None
     if "X_umap" in adata.obsm:
@@ -139,24 +172,62 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
     var_names = adata.var.index.astype(str).to_numpy()
 
     # Persist metadata arrays.
-    root.array("cell_ids", cell_ids, dtype="object", chunks=(tile_size,),
-               object_codec=zarr.codecs.VLenUTF8(), overwrite=True)
+    root.array(
+        "cell_ids",
+        cell_ids,
+        dtype="object",
+        chunks=(tile_size,),
+        object_codec=zarr.codecs.VLenUTF8(),
+        overwrite=True,
+    )
     if louvain is not None:
-        root.array("louvain", louvain, dtype="object", chunks=(tile_size,),
-                   object_codec=zarr.codecs.VLenUTF8(), overwrite=True)
+        root.array(
+            "louvain",
+            louvain,
+            dtype="object",
+            chunks=(tile_size,),
+            object_codec=zarr.codecs.VLenUTF8(),
+            overwrite=True,
+        )
     if umap is not None:
         root.array("umap", umap, dtype="f4", chunks=(tile_size, 2), overwrite=True)
-    root.array("var_names", var_names, dtype="object",
-               chunks=(tile_size,), object_codec=zarr.codecs.VLenUTF8(),
-               overwrite=True)
+    root.array(
+        "var_names",
+        var_names,
+        dtype="object",
+        chunks=(tile_size,),
+        object_codec=zarr.codecs.VLenUTF8(),
+        overwrite=True,
+    )
 
     # Per-level shape table for the client.
     shapes = []
-    h, w = n_cells, n_genes
+    # Matrix is transposed: (n_genes, n_cells) -> h=n_genes, w=n_cells.
+    h, w = n_genes, n_cells
     for level in range(n_levels):
         shapes.append([int(h), int(w)])
         h = h // 2
         w = w // 2
+
+    # Cluster groups for the frontend SpatialLayout (gap math). Each group
+    # is a contiguous run of cells sharing the same cluster label, in the
+    # reordered (cluster-sorted) column space.
+    groups = []
+    if louvain is not None:
+        prev = None
+        start = 0
+        for i, lab in enumerate(louvain):
+            if lab != prev:
+                if prev is not None:
+                    groups.append({"id": str(prev), "size": i - start})
+                prev = lab
+                start = i
+        if prev is not None:
+            groups.append({"id": str(prev), "size": len(louvain) - start})
+    # Fallback: a single group spanning all cells.
+    if not groups:
+        groups = [{"id": "0", "size": int(n_cells)}]
+    print(f"[build] cluster groups: {len(groups)}")
 
     meta = {
         "n_cells": int(n_cells),
@@ -169,6 +240,8 @@ def build(h5ad_path: Path = H5AD_PATH, zarr_path: Path = ZARR_PATH,
         "layer": used_key,
         "colormap": "viridis",
         "cell_order": order.tolist(),
+        "groups": groups,
+        "cluster_col": louvain_col,
     }
     with open(zarr_path / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -185,8 +258,7 @@ def main():
     p.add_argument("--tile-size", type=int, default=TILE_SIZE)
     p.add_argument("--no-overwrite", action="store_true")
     args = p.parse_args()
-    build(args.h5ad, args.zarr, args.layer, args.tile_size,
-          overwrite=not args.no_overwrite)
+    build(args.h5ad, args.zarr, args.layer, args.tile_size, overwrite=not args.no_overwrite)
 
 
 if __name__ == "__main__":

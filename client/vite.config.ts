@@ -1,5 +1,5 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -7,11 +7,15 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // Proxy API calls to the FastAPI backend during development.
-      '/api': {
-        target: 'http://127.0.0.1:8000',
+      // Proxy API + static tile calls to the FastAPI backend during development.
+      "/api": {
+        target: "http://127.0.0.1:8001",
+        changeOrigin: true,
+      },
+      "/tiles": {
+        target: "http://127.0.0.1:8001",
         changeOrigin: true,
       },
     },
   },
-})
+});

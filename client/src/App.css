@@ -400,3 +400,82 @@ body {
   background: var(--accent);
   color: #0d1117;
 }
+
+/* ---------------------------------------------------------------- */
+/* Controls panel (cluster gap + palette switching)                  */
+/* ---------------------------------------------------------------- */
+
+.controls {
+  position: absolute;
+  left: 16px;
+  top: 60px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(22, 27, 34, 0.85);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 10px 12px;
+  backdrop-filter: blur(4px);
+}
+
+.ctrl-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.ctrl-label {
+  color: var(--muted);
+  font-weight: 600;
+  min-width: 52px;
+}
+
+.ctrl-row input[type='range'] {
+  width: 140px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.ctrl-value {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  min-width: 32px;
+  text-align: right;
+}
+
+.palette-swatches {
+  display: flex;
+  gap: 6px;
+}
+
+.palette-btn {
+  background: none;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  padding: 2px;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.1s;
+}
+
+.palette-btn:hover {
+  border-color: #586069;
+}
+
+.palette-btn.active {
+  border-color: var(--accent);
+}
+
+.palette-btn:active {
+  transform: scale(0.94);
+}
+
+.palette-preview {
+  display: block;
+  width: 64px;
+  height: 14px;
+  border-radius: 2px;
+}

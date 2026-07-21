@@ -6,15 +6,25 @@ GET  /api/meta            -> pyramid metadata (dimensions, levels, value range)
 GET  /api/tile/{l}/{r}/{c} -> PNG tile at pyramid level l, tile row r, col c
 GET  /api/obs             -> cell labels, louvain, umap
 GET  /api/var             -> gene names
+GET  /api/groups          -> cluster groups (id + size) for the SpatialLayout
 GET  /api/value/{c}/{g}   -> raw expression value for one cell-gene pair
 POST /api/custom          -> build a custom sub-matrix pyramid for selected genes
 GET  /api/custom/{id}/meta            -> custom pyramid metadata
 GET  /api/custom/{id}/tile/{l}/{r}/{c} -> custom pyramid tile PNG
+GET  /tiles/{level}/{row}_{col}.png    -> static pre-rendered grayscale PNG
 GET  /                     -> health check
+
+The dynamic zarr-backed endpoints (/api/tile, /api/custom) are kept for
+development convenience, but per the architecture spec the production path
+should use the static pre-rendered tiles under /tiles/ (see
+``backend.generate_pyramid``). All tiles are 8-bit grayscale; colour mapping
+is done on the GPU (Rule #2).
 """
+
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -22,11 +32,15 @@ import numpy as np
 import zarr
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from .config import HOST, PORT, TILE_SIZE, ZARR_PATH
 from .tile_render import render_tile_png
+
+# Directory of pre-rendered static grayscale PNG tiles (Rule #1).
+TILES_DIR = Path(os.environ.get("HEATMAP_TILES_DIR", ZARR_PATH.parent / "tiles"))
+STATIC_DATASET_ID = os.environ.get("HEATMAP_DATASET_ID", "default")
 
 app = FastAPI(title="Heatmap Pyramid Server", version="0.1.0")
 app.add_middleware(
@@ -94,7 +108,21 @@ _store = PyramidStore(ZARR_PATH)
 
 @app.get("/")
 def health():
-    return {"status": "ok", "zarr": str(ZARR_PATH)}
+    return {"status": "ok", "zarr": str(ZARR_PATH), "tiles_dir": str(TILES_DIR)}
+
+
+@app.get("/tiles/{level}/{row}_{col}.png")
+def get_static_tile(level: int, row: int, col: int):
+    """Serve a pre-rendered static grayscale PNG tile (Rule #1).
+
+    Path layout: ``/tiles/{dataset_id}/{level}/{row}_{col}.png``. We serve
+    the dataset-id segment from the STATIC_DATASET_ID env var so the client
+    URL stays stable: ``/tiles/{level}/{row}_{col}.png``.
+    """
+    tile_path = TILES_DIR / STATIC_DATASET_ID / str(level) / f"{row}_{col}.png"
+    if not tile_path.is_file():
+        raise HTTPException(status_code=404, detail="static tile not found")
+    return FileResponse(tile_path, media_type="image/png")
 
 
 @app.get("/api/meta")
@@ -131,6 +159,18 @@ def get_obs():
     return out
 
 
+@app.get("/api/groups")
+def get_groups():
+    """Return the cluster groups (id + size) for the frontend SpatialLayout.
+
+    Groups are contiguous runs of cells sharing a cluster label, in the
+    reordered (cluster-sorted) column space. Used by the client to compute
+    cluster gap offsets and the total world width.
+    """
+    _store.open()
+    return {"groups": _store.meta.get("groups", [])}
+
+
 @app.get("/api/var")
 def get_var():
     _store.open()
@@ -147,37 +187,44 @@ def get_value(cell: int, gene: int):
     try:
         _store.open()
         arr = _store.array(0)
-        n_cells, n_genes = arr.shape
+        # Matrix is transposed: (n_genes, n_cells) -> [gene, cell].
+        n_genes, n_cells = arr.shape
         if not (0 <= cell < n_cells and 0 <= gene < n_genes):
             raise HTTPException(status_code=404, detail="index out of range")
         # Read just the single element from the zarr chunk.
-        value = float(arr[cell, gene])
+        value = float(arr[gene, cell])
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"cell": cell, "gene": gene, "value": value}
 
 
 class CustomPyramid:
-    """An in-memory pyramid built from a subset of genes (columns) of level 0.
+    """An in-memory pyramid built from a subset of genes (rows) of level 0.
+
+    The level-0 matrix is stored transposed as (n_genes, n_cells) so that
+    X axis = cells (columns) and Y axis = genes (rows). Selecting a subset of
+    genes therefore selects rows, not columns.
 
     Stored as a dict of {id: {levels: [np.ndarray], meta: dict}}. Entries
     expire after 30 minutes of inactivity to bound memory.
     """
+
     def __init__(self):
         self._stores: dict[str, dict] = {}
 
     def build(self, gene_indices: list[int]) -> str:
         _store.open()
         arr0 = _store.array(0)
-        n_cells, n_genes = arr0.shape
+        # Matrix is transposed: (n_genes, n_cells) -> rows = genes, cols = cells.
+        n_genes, n_cells = arr0.shape
         # Validate indices.
         idx = np.asarray(gene_indices, dtype=np.int64)
         if idx.size == 0:
             raise ValueError("no genes selected")
         if idx.min() < 0 or idx.max() >= n_genes:
             raise IndexError("gene index out of range")
-        # Select columns from level 0.
-        sub = np.asarray(arr0[:, idx], dtype=np.float32)
+        # Select rows (genes) from level 0; columns (cells) are kept intact.
+        sub = np.asarray(arr0[idx, :], dtype=np.float32)
         n_sel = len(idx)
         # Build pyramid by 2x2 mean-pooling until both dims <= TILE_SIZE.
         levels = [sub]
@@ -215,6 +262,9 @@ class CustomPyramid:
                 "layer": _store.meta.get("layer", "X"),
                 "colormap": "viridis",
                 "gene_indices": idx.tolist(),
+                # Custom pyramids reuse the full pyramid's cluster groups so
+                # the frontend SpatialLayout (gap math) still applies.
+                "groups": _store.meta.get("groups", [{"id": "0", "size": int(n_cells)}]),
             },
         }
         return cid
@@ -298,6 +348,7 @@ def get_custom_var(cid: str):
 
 def main():
     import uvicorn
+
     uvicorn.run("backend.server:app", host=HOST, port=PORT, reload=False)
 
 

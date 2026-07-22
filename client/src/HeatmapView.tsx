@@ -14,7 +14,6 @@ import {
   fetchObs,
   fetchVar,
   fetchGroups,
-  fetchValue,
   fetchCustomVar,
   createCustomPyramid,
   customTileUrl,
@@ -27,9 +26,10 @@ import {
   computeVisibleTiles,
   createTileLayers,
   createGapOverlayLayers,
+  createTileBorderLayer,
+  type VisibleTile,
 } from "./HeatmapTileLayer";
 import { createAxisLayers, createClusterAnnotationLayers } from "./AxisLabels";
-import { createPickingLayer, type PickSquare } from "./PickingLayer";
 import { SpatialLayout } from "./SpatialLayout";
 import {
   getLutData,
@@ -255,15 +255,12 @@ export default function HeatmapView() {
     return () => ro.disconnect();
   }, []);
 
-  // Hover tooltip state.
+  // Hover tooltip state — shows tile info (level, row, col, bounds) instead
+  // of per-cell/gene values.
   const [hover, setHover] = useState<{
     x: number;
     y: number;
-    cell: number;
-    gene: number;
-    cellName: string;
-    geneName: string;
-    value: number | null;
+    tile: VisibleTile;
   } | null>(null);
 
   // The "active" metadata + gene names: custom pyramid when built, else full.
@@ -302,33 +299,32 @@ export default function HeatmapView() {
     const axisLayers =
       cellIds.length || genes.length
         ? createAxisLayers(
-            activeMeta,
-            cellIds,
-            genes,
-            zoom,
-            size.width,
-            size.height,
-          )
+          activeMeta,
+          cellIds,
+          genes,
+          zoom,
+          size.width,
+          size.height,
+        )
         : [];
     // Cluster annotation ticks + labels above the heatmap, positioned
     // via the SpatialLayout so they line up with the cluster-gap split.
     const clusterAnnotationLayers = activeGroups.length
       ? createClusterAnnotationLayers(activeMeta, activeGroups, layout, zoom)
       : [];
-    // Picking overlay (only when zoomed in enough that few squares are visible).
-    const pickingLayer = createPickingLayer(
-      activeMeta,
-      target,
-      zoom,
-      size.width,
-      size.height,
+    // Tile border overlay: a pickable transparent-filled polygon per tile
+    // with a subtle stroke outline. Hovering a tile highlights its border
+    // and shows tile info (level/row/col/bounds) in the tooltip.
+    const tileBorderLayer = createTileBorderLayer(
+      tiles,
+      custom ? "ctile-border" : "tile-border",
     );
     return [
       ...tileLayers,
       ...gapOverlayLayers,
+      tileBorderLayer,
       ...clusterAnnotationLayers,
       ...axisLayers,
-      ...(pickingLayer ? [pickingLayer] : []),
     ];
   }, [
     activeMeta,
@@ -381,40 +377,20 @@ export default function HeatmapView() {
     setCustomError(null);
   }, []);
 
-  // On hover over a picking square, fetch the expression value + names.
+  // On hover over a tile border polygon, show tile info (level/row/col/bounds).
   const onHover = useCallback(
-    (info: { x?: number; y?: number; object?: PickSquare } | null) => {
+    (info: { x?: number; y?: number; object?: VisibleTile } | null) => {
       if (!info || !info.object) {
         setHover(null);
         return;
       }
-      const { cell, gene } = info.object;
-      const cellName = obs?.cell_ids?.[cell] ?? `cell ${cell}`;
-      const geneName = activeVarNames?.[gene] ?? `gene ${gene}`;
       setHover({
         x: info.x ?? 0,
         y: info.y ?? 0,
-        cell,
-        gene,
-        cellName,
-        geneName,
-        value: null,
+        tile: info.object,
       });
-      // Fetch the raw value asynchronously. In custom mode, the gene
-      // index is relative to the custom pyramid's column order, so we
-      // map it back to the original gene index for the /api/value call.
-      const origGene = custom ? custom.gene_indices[gene] : gene;
-      fetchValue(cell, origGene)
-        .then((r) => {
-          setHover((h) =>
-            h && h.cell === cell && h.gene === gene
-              ? { ...h, value: r.value }
-              : h,
-          );
-        })
-        .catch(() => {});
     },
-    [obs, activeVarNames, custom],
+    [],
   );
 
   if (error) {
@@ -526,29 +502,36 @@ export default function HeatmapView() {
   );
 }
 
-/** Hover tooltip showing gene, cell, and expression value. */
+/** Hover tooltip showing tile info (level, row, col, world bounds). */
 function Tooltip({
   hover,
 }: {
   hover: {
     x: number;
     y: number;
-    cellName: string;
-    geneName: string;
-    value: number | null;
+    tile: VisibleTile;
   };
 }) {
+  const { level, row, col, bounds } = hover.tile;
+  // bounds order: [bottomLeft, topLeft, topRight, bottomRight]
+  const [bl, , tr] = bounds;
+  const x0 = bl[0];
+  const y0 = bl[1];
+  const x1 = tr[0];
+  const y1 = tr[1];
   return (
     <div className="tooltip" style={{ left: hover.x + 12, top: hover.y + 12 }}>
       <div>
-        <span className="tt-label">Gene:</span> {hover.geneName}
+        <span className="tt-label">Tile:</span> level {level}, row {row}, col{" "}
+        {col}
       </div>
       <div>
-        <span className="tt-label">Cell:</span> {hover.cellName}
+        <span className="tt-label">Bounds:</span> [{x0.toFixed(0)}, {y0.toFixed(0)}]
+        → [{x1.toFixed(0)}, {y1.toFixed(0)}]
       </div>
       <div>
-        <span className="tt-label">Expression:</span>{" "}
-        {hover.value === null ? "…" : hover.value.toFixed(4)}
+        <span className="tt-label">Size:</span> {(x1 - x0).toFixed(0)} ×{" "}
+        {(y1 - y0).toFixed(0)} world units
       </div>
     </div>
   );
@@ -595,7 +578,11 @@ function Info({
 }) {
   const zoom = Number(viewState.zoom ?? 0);
   const maxLevel = meta.n_levels - 1;
-  const level = Math.max(0, Math.min(maxLevel, maxLevel - Math.round(zoom)));
+  // Must match the level selection in computeVisibleTiles() exactly, so the
+  // displayed level reflects the tiles actually being loaded. Level 0 = full
+  // resolution (finest); level maxLevel = most downsampled (coarsest). At
+  // zoom z, the best level is floor(-z) clamped to [0, maxLevel].
+  const level = Math.max(0, Math.min(maxLevel, Math.floor(-zoom)));
   return (
     <div className="info">
       <div>

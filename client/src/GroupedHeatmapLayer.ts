@@ -17,11 +17,30 @@
 import { BitmapLayer } from "@deck.gl/layers";
 import { Texture } from "@luma.gl/core";
 
+/**
+ * Shader module that declares the `dataExtent` uniform (fraction of the
+ * 256px texture holding real data) used to remap UVs on edge tiles. This
+ * must be a registered module so luma.gl knows the uniform type and can
+ * route the value set via `model.shaderInputs.setProps`.
+ */
+const heatmapUniforms = {
+  name: "heatmap",
+  fs: `\
+layout(std140) uniform heatmapUniforms {
+  vec2 dataExtent;
+} heatmap;
+`,
+  uniformTypes: {
+    dataExtent: "vec2<f32>",
+  },
+};
+
 /** Props for the grouped heatmap layer (extends BitmapLayer). */
 export interface GroupedHeatmapLayerProps {
   /** Grayscale tile image (HTMLImageElement / Texture). */
   image: any;
-  /** 4-corner world-space bounds [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]. */
+  /** 4-corner world-space bounds in deck.gl order:
+   *  [bottomLeft, topLeft, topRight, bottomRight]. */
   bounds: [
     [number, number],
     [number, number],
@@ -30,6 +49,10 @@ export interface GroupedHeatmapLayerProps {
   ];
   /** 256x1 RGBA colour LUT texture (built from colormap.ts getLutData). */
   colorMapLUT?: Texture;
+  /** Fraction of the 256px texture holding real data: [uExtent, vExtent].
+   *  Interior tiles are [1,1]; edge tiles are < 1 on the trimmed axis. The
+   *  shader remaps UVs so only the data region fills the world bounds. */
+  dataExtent?: [number, number];
   /** Texture filtering parameters. */
   textureParameters?: Record<string, any>;
   /** Optional layer id. */
@@ -96,6 +119,13 @@ void main(void) {
     uv = getUV(commonPos);
   }
 
+  // Remap UVs from [0,1] into [0, heatmap.dataExtent] so only the real-data
+  // region of the texture is sampled. Edge tiles are padded with byte 0
+  // (null); without this remap the padding would be stretched across the
+  // world bounds and show as a black strip. With it, the data region fills
+  // the entire bounds and the padding is never sampled.
+  uv = uv * heatmap.dataExtent;
+
   // 1. Fetch the raw grayscale byte value (0..255) from the tile texture.
   //    The texture sampler returns it normalised to 0.0..1.0, so multiply
   //    back to the 0..255 byte range.
@@ -129,12 +159,15 @@ export class GroupedHeatmapLayer extends BitmapLayer {
   static defaultProps = {
     ...BitmapLayer.defaultProps,
     colorMapLUT: { type: "object", value: null, async: true },
+    dataExtent: { type: "array", value: [1, 1], compare: true },
   };
 
   getShaders() {
     const shaders = super.getShaders();
-    // Replace the fragment shader with our colour-mapping version.
+    // Replace the fragment shader with our colour-mapping version and add
+    // the heatmap uniform module so `dataExtent` is a registered uniform.
     shaders.fs = customFragmentShader;
+    shaders.modules = [...(shaders.modules ?? []), heatmapUniforms];
     return shaders;
   }
 
@@ -143,8 +176,14 @@ export class GroupedHeatmapLayer extends BitmapLayer {
     const { model, coordinateConversion, bounds, disablePicking } = this.state;
     // `colorMapLUT` is a custom prop we added via defaultProps; cast to access it.
     const props = this.props as any;
-    const { image, desaturate, transparentColor, tintColor, colorMapLUT } =
-      props;
+    const {
+      image,
+      desaturate,
+      transparentColor,
+      tintColor,
+      colorMapLUT,
+      dataExtent,
+    } = props;
     if (shaderModuleProps.picking.isActive && disablePicking) {
       return;
     }
@@ -161,6 +200,11 @@ export class GroupedHeatmapLayer extends BitmapLayer {
         colorMapLUT,
       };
       model.shaderInputs.setProps({ bitmap: bitmapProps });
+      // Data extent uniform for edge-tile UV remapping (registered via the
+      // heatmap shader module, so it must be set under the "heatmap" key).
+      model.shaderInputs.setProps({
+        heatmap: { dataExtent: dataExtent ?? [1, 1] },
+      });
       model.draw(this.context.renderPass);
     }
   }

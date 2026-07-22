@@ -25,7 +25,10 @@ import numpy as np
 import zarr
 from anndata import read_h5ad
 
-from .config import H5AD_PATH, LAYER_KEY, TILE_SIZE, ZARR_PATH
+try:
+    from .config import H5AD_PATH, LAYER_KEY, TILE_SIZE, ZARR_PATH
+except ImportError:  # allow running as a plain script: python backend/build_pyramid.py
+    from config import H5AD_PATH, LAYER_KEY, TILE_SIZE, ZARR_PATH
 
 
 def _load_matrix(adata, layer_key: str) -> tuple[np.ndarray, str]:
@@ -141,6 +144,13 @@ def build(
     for level in range(n_levels):
         h_l, w_l = current.shape
         chunks = (min(tile_size, h_l), min(tile_size, w_l))
+        # Rechunk the dask array to the desired chunk size before writing.
+        # Without this, to_zarr() uses the dask array's own chunk size, which
+        # gets halved at every level by _coarsen_mean() (256→128→64→32→16...),
+        # producing far too many small chunks. Rechunking ensures every level
+        # is stored with consistent tile-aligned chunks (256×256 or smaller
+        # for the last level), matching how generate_pyramid.py reads them.
+        current = current.rechunk(chunks)
         z = root.zeros(
             f"level_{level}",
             shape=(h_l, w_l),

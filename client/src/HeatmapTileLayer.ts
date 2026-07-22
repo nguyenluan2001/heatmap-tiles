@@ -1,5 +1,5 @@
 import { Texture } from "@luma.gl/core";
-import { SolidPolygonLayer } from "@deck.gl/layers";
+import { PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
 
 import { GroupedHeatmapLayer } from "./GroupedHeatmapLayer";
 import { SpatialLayout } from "./SpatialLayout";
@@ -12,17 +12,28 @@ const GAP_MASK_COLOR: [number, number, number, number] = [13, 17, 23, 255];
 /** Function that builds a tile PNG URL from (level, row, col). */
 export type TileUrlFn = (level: number, row: number, col: number) => string;
 
-/** A single visible tile with its world-space bounds (4 corners). */
+/** A single visible tile with its world-space bounds (4 corners) and data extent.
+ *
+ * The PNG tile is always 256×256 pixels, but edge tiles may contain fewer
+ * real data pixels (the rest is byte-0 padding). `dataExtent` gives the
+ * fraction [0,1] of the texture that holds real data along each axis, so the
+ * shader can remap UVs to fill the world bounds with only the data region.
+ */
 export interface VisibleTile {
   level: number;
   row: number;
   col: number;
+  /** 4-corner world bounds in deck.gl BitmapLayer order:
+   *  [bottomLeft, topLeft, topRight, bottomRight]. */
   bounds: [
     [number, number],
     [number, number],
     [number, number],
     [number, number],
   ];
+  /** Fraction of the 256px texture holding real data: [uExtent, vExtent].
+   *  Interior tiles are [1,1]; edge tiles are < 1 on the trimmed axis. */
+  dataExtent: [number, number];
 }
 
 /**
@@ -95,6 +106,10 @@ export function computeVisibleTiles(
     const y1 = (r + 1) * tileWorldH;
     // Quick Y reject: skip rows entirely above/below the viewport.
     if (y1 < north - marginY || y0 > south + marginY) continue;
+    // Data extent along Y (genes/rows): how much of this tile row holds real
+    // data vs. NaN padding. Interior rows are full (1.0); the last row may be
+    // partial because h is not a multiple of TILE.
+    const vExtent = Math.min(1, (h - r * TILE) / TILE);
     for (let c = 0; c < nCols; c++) {
       // X bounds: apply the SpatialLayout gap offset map so tiles are
       // positioned with cluster gaps. When no layout is provided (gap=0),
@@ -105,17 +120,23 @@ export function computeVisibleTiles(
       const x1 = layout ? layout.mapColToWorldX(endCol) : (c + 1) * tileWorldW;
       // Quick X reject: skip tiles entirely left/right of the viewport.
       if (x1 < west - marginX || x0 > east + marginX) continue;
+      // Data extent along X (cells/cols): fraction of the tile that holds real
+      // data. Interior tiles are full (1.0); the last column may be partial.
+      const uExtent = Math.min(1, (w - c * TILE) / TILE);
       tiles.push({
         level,
         row: r,
         col: c,
-        // 4-corner bounds: [topLeft, topRight, bottomRight, bottomLeft]
+        // 4-corner bounds in deck.gl BitmapLayer order:
+        // [bottomLeft, topLeft, topRight, bottomRight].
+        // World coords: X = cells (right), Y = genes (down).
         bounds: [
-          [x0, y0],
-          [x1, y0],
-          [x1, y1],
-          [x0, y1],
+          [x0, y1], // bottomLeft
+          [x0, y0], // topLeft
+          [x1, y0], // topRight
+          [x1, y1], // bottomRight
         ],
+        dataExtent: [uExtent, vExtent],
       });
     }
   }
@@ -142,6 +163,10 @@ export function createTileLayers(
       image: urlFn(t.level, t.row, t.col),
       bounds: t.bounds,
       colorMapLUT,
+      // Data extent (fraction of the 256px texture holding real data) so the
+      // shader can remap UVs and fill the world bounds with only the data
+      // region, hiding the byte-0 padding on edge tiles.
+      dataExtent: t.dataExtent,
       // Nearest filtering keeps each cell-gene a crisp square instead
       // of blurring neighbours together.
       textureParameters: {
@@ -201,4 +226,32 @@ export function createGapOverlayLayers(
       // the tile layers and the annotation layers.
     } as any),
   ];
+}
+
+/**
+ * Build a pickable PolygonLayer that draws a thin border around every visible
+ * tile. The fill is fully transparent (so the heatmap shows through) but the
+ * polygon is still pickable across its entire area, letting hover anywhere on
+ * a tile trigger the tooltip. The stroke is a subtle accent-coloured outline;
+ * the hovered tile is highlighted via autoHighlight.
+ */
+export function createTileBorderLayer(
+  tiles: VisibleTile[],
+  idPrefix = "tile-border",
+) {
+  return new PolygonLayer({
+    id: idPrefix,
+    data: tiles,
+    getPolygon: (d: VisibleTile) => d.bounds,
+    stroked: true,
+    filled: true,
+    getFillColor: [0, 0, 0, 0], // transparent fill, but pickable
+    getLineColor: [88, 166, 255, 100], // subtle accent border
+    getLineWidth: 1,
+    lineWidthUnits: "pixels",
+    pickable: true,
+    autoHighlight: true,
+    highlightColor: [88, 166, 255, 40],
+    parameters: { depthTest: false },
+  });
 }

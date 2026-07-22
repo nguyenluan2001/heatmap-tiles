@@ -28,8 +28,12 @@ from pathlib import Path
 import numpy as np
 import zarr
 
-from .config import TILE_SIZE, ZARR_PATH
-from .tile_render import render_tile_png
+try:
+    from .config import TILE_SIZE, ZARR_PATH
+    from .tile_render import render_tile_png
+except ImportError:  # allow running as a plain script: python backend/generate_pyramid.py
+    from config import TILE_SIZE, ZARR_PATH
+    from tile_render import render_tile_png
 
 
 def generate(

@@ -22,11 +22,15 @@ export interface PyramidMeta {
   groups?: GroupConfig[];
 }
 
-/** Cell-level metadata returned by GET /api/obs. */
+/** Cell-level metadata returned by GET /api/obs (full, small datasets) or
+ *  GET /api/obs/range (lazy, large datasets). */
 export interface ObsData {
   cell_ids: string[];
   louvain?: string[];
   umap?: [number, number][];
+  /** Range bounds (only present for /api/obs/range responses). */
+  start?: number;
+  end?: number;
 }
 
 const http = axios.create({
@@ -41,6 +45,19 @@ export async function fetchMeta(): Promise<PyramidMeta> {
 
 export async function fetchObs(): Promise<ObsData> {
   const { data } = await http.get<ObsData>("/obs");
+  return data;
+}
+
+/** Fetch cell metadata for a half-open range [start, end) — for lazy axis
+ *  label fetching on large datasets. Only the cells visible in the current
+ *  viewport are requested, keeping browser memory bounded. */
+export async function fetchObsRange(
+  start: number,
+  end: number,
+): Promise<ObsData> {
+  const { data } = await http.get<ObsData>("/obs/range", {
+    params: { start, end },
+  });
   return data;
 }
 
@@ -63,11 +80,27 @@ export async function fetchValue(
   return data;
 }
 
-/** Build the URL for a single static grayscale tile PNG (Rule #1: no dynamic
- *  rendering on the backend API). The server serves pre-rendered tiles from
- *  /tiles/{level}/{row}_{col}.png. Using a direct URL (not axios) lets
- *  deck.gl's BitmapLayer manage image loading + caching efficiently. */
+/**
+ * Build the URL for a single tile PNG. For large datasets (>1M cells) we use
+ * the dynamic zarr-backed endpoint (/api/tile/...) which renders tiles
+ * on-the-fly and caches them on disk. For small datasets the static
+ * pre-rendered path (/tiles/...) may be used (set HEATMAP_STATIC_TILES=1 on
+ * the backend). Using a direct URL (not axios) lets deck.gl's BitmapLayer
+ * manage image loading + caching efficiently.
+ *
+ * The dynamic flag is read from /api/meta once and cached here.
+ */
+let _useDynamicTiles = true;
+
+/** Set whether to use dynamic tiles (called after fetching meta / health). */
+export function setUseDynamicTiles(dynamic: boolean): void {
+  _useDynamicTiles = dynamic;
+}
+
 export function tileUrl(level: number, row: number, col: number): string {
+  if (_useDynamicTiles) {
+    return `/api/tile/${level}/${row}/${col}`;
+  }
   return `/tiles/${level}/${row}_${col}.png`;
 }
 
@@ -102,7 +135,7 @@ export async function fetchCustomVar(
   return data;
 }
 
-/** Build the URL for a custom pyramid tile PNG. */
+/** Build the URL for a custom pyramid tile PNG (always dynamic). */
 export function customTileUrl(
   cid: string,
   level: number,

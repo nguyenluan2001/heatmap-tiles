@@ -47,7 +47,17 @@ export interface VisibleTile {
  *
  * Level selection: at level L the matrix is downsampled by 2^L, so one
  * level-L cell spans 2^L world units = 2^(z+L) screen pixels. We want ~1
- * screen pixel per cell, i.e. z + L ≈ 0  =>  L ≈ -z (clamped to [0, maxLevel]).
+ * screen pixel per cell, i.e. z + L ≈ 0 => L ≈ -z (clamped to [0, maxLevel]).
+ *
+ * Performance (Phase 6 of the 20M-cell plan): instead of iterating ALL tiles
+ * at the selected level (O(nRows × nCols) — 6.2M tiles at level 0 for 20M
+ * cells, which freezes the browser), we compute the visible tile index range
+ * directly from the viewport bounds. The Y axis (genes) is linear so the
+ * row range is a direct floor/ceil. The X axis (cells) is linear when there
+ * are no cluster gaps; when gaps are present we use a binary search over the
+ * layout's group starts to find the first/last tile column intersecting the
+ * viewport, then a tight reject loop only over that candidate range. This
+ * keeps the work O(visible tiles) instead of O(total tiles).
  *
  * Per Rule #3 (No Matrix Padding Expansion), edge tiles retain standard full
  * bounds coordinates to avoid pixel distortion and aspect-ratio skewing.
@@ -63,7 +73,7 @@ export function computeVisibleTiles(
   const { tile_size: TILE, levels, n_levels } = meta;
   const maxLevel = n_levels - 1;
 
-  // Visible world rectangle (clamped to the matrix bounds).
+  // Visible world rectangle.
   const visW = width / Math.pow(2, zoom);
   const visH = height / Math.pow(2, zoom);
   const west = target[0] - visW / 2;
@@ -71,11 +81,31 @@ export function computeVisibleTiles(
   const north = target[1] - visH / 2;
   const south = target[1] + visH / 2;
 
+  console.log("computeTiles", {
+    visW,
+    visH,
+    west,
+    east,
+    north,
+    south,
+  });
+
   // Pick the pyramid level for this zoom. We floor (not round) so we prefer
   // finer levels — a slightly-too-fine tile downscaled by the GPU with
   // nearest filtering stays crisp, whereas a coarser tile looks blurry.
   let level = Math.floor(-zoom);
   level = Math.max(0, Math.min(maxLevel, level));
+
+  // Cap the level so the gene (row) dimension doesn't collapse below 1.
+  // Each level halves the resolution, so the max level that keeps at least
+  // 1 gene row is floor(log2(n_genes)). Without this cap, a custom pyramid
+  // with 3 genes would show level 2+ where genes are merged into 0-1 rows,
+  // causing axis labels to overlap.
+  const nGenes = levels[0][0];
+  if (nGenes > 0 && nGenes < TILE) {
+    const maxGeneLevel = Math.floor(Math.log2(nGenes));
+    level = Math.min(level, maxGeneLevel);
+  }
 
   const [h, w] = levels[level];
   const nRows = Math.ceil(h / TILE);
@@ -88,29 +118,57 @@ export function computeVisibleTiles(
   const tileWorldW = TILE * downsample;
   const tileWorldH = TILE * downsample;
 
-  // Visible tile index range. Rather than converting gap-included world
-  // bounds back to raw indices (fragile and the root cause of interleaved
-  // missing tiles), we iterate ALL tiles at the selected level and keep
-  // only those whose world bounds intersect the viewport rectangle. This
-  // is O(nRows * nCols) — cheap for this matrix size — and guarantees no
-  // tile is wrongly culled by index-arithmetic mismatches.
-  //
-  // The reject margin is a few tile widths so partially-visible edge
-  // tiles are always included even when the viewport fit is slightly off
-  // or cluster gaps stretch the world span.
+  // Reject margin: a few tile widths so partially-visible edge tiles are
+  // always included even when the viewport fit is slightly off or cluster
+  // gaps stretch the world span.
   const marginX = tileWorldW * 3;
   const marginY = tileWorldH * 3;
+
+  // ---- Y axis (genes): linear — compute row range directly ----
+  const r0 = Math.max(0, Math.floor((north - marginY) / tileWorldH));
+  const r1 = Math.min(nRows - 1, Math.floor((south + marginY) / tileWorldH));
+
+  // ---- X axis (cells): compute column range ----
+  // Without a layout (gap = 0) the X axis is linear too, so we can compute
+  // the column range directly. With cluster gaps the world X is non-linear,
+  // so we binary-search the layout for the first/last tile column whose
+  // world bounds intersect [west - marginX, east + marginX], then do a
+  // tight reject loop over that candidate range.
+  let c0: number;
+  let c1: number;
+  const hasGapLayout = layout && layout.gapSize > 0 && layout.nGroups > 0;
+  if (!hasGapLayout) {
+    c0 = Math.max(0, Math.floor((west - marginX) / tileWorldW));
+    c1 = Math.min(nCols - 1, Math.floor((east + marginX) / tileWorldW));
+  } else {
+    // Binary search for the first tile column with worldX >= west - margin.
+    c0 = _findFirstTileColInViewport(
+      layout,
+      west - marginX,
+      TILE,
+      downsample,
+      w,
+    );
+    c1 = _findLastTileColInViewport(
+      layout,
+      east + marginX,
+      TILE,
+      downsample,
+      w,
+    );
+  }
+  // Guard against empty ranges.
+  if (r0 > r1 || c0 > c1) return [];
+
   const tiles: VisibleTile[] = [];
-  for (let r = 0; r < nRows; r++) {
+  for (let r = r0; r <= r1; r++) {
     const y0 = r * tileWorldH;
     const y1 = (r + 1) * tileWorldH;
-    // Quick Y reject: skip rows entirely above/below the viewport.
-    if (y1 < north - marginY || y0 > south + marginY) continue;
     // Data extent along Y (genes/rows): how much of this tile row holds real
     // data vs. NaN padding. Interior rows are full (1.0); the last row may be
     // partial because h is not a multiple of TILE.
     const vExtent = Math.min(1, (h - r * TILE) / TILE);
-    for (let c = 0; c < nCols; c++) {
+    for (let c = c0; c <= c1; c++) {
       // X bounds: apply the SpatialLayout gap offset map so tiles are
       // positioned with cluster gaps. When no layout is provided (gap=0),
       // this reduces to the plain tile bounds.
@@ -118,7 +176,7 @@ export function computeVisibleTiles(
       const endCol = (c + 1) * TILE * downsample;
       const x0 = layout ? layout.mapColToWorldX(startCol) : c * tileWorldW;
       const x1 = layout ? layout.mapColToWorldX(endCol) : (c + 1) * tileWorldW;
-      // Quick X reject: skip tiles entirely left/right of the viewport.
+      // Tight X reject: skip tiles entirely left/right of the viewport.
       if (x1 < west - marginX || x0 > east + marginX) continue;
       // Data extent along X (cells/cols): fraction of the tile that holds real
       // data. Interior tiles are full (1.0); the last column may be partial.
@@ -141,6 +199,79 @@ export function computeVisibleTiles(
     }
   }
   return tiles;
+}
+
+/**
+ * Binary search for the first tile column (at the given level) whose world-X
+ * start is >= ``minWorldX``. Used when cluster gaps make the X axis
+ * non-linear, so we can't compute the column range from world bounds directly.
+ *
+ * Returns a column index in [0, nCols-1]. If no tile reaches ``minWorldX``,
+ * returns 0 (the leftmost tile).
+ */
+function _findFirstTileColInViewport(
+  layout: SpatialLayout,
+  minWorldX: number,
+  tile: number,
+  downsample: number,
+  w: number,
+): number {
+  const nCols = Math.ceil(w / tile);
+  if (minWorldX <= 0) return 0;
+  let lo = 0;
+  let hi = nCols - 1;
+  let result = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const startCol = mid * tile * downsample;
+    const x0 = layout.mapColToWorldX(startCol);
+    if (x0 < minWorldX) {
+      // This tile starts before the viewport; the answer is at or after mid.
+      result = mid + 1 <= nCols - 1 ? mid + 1 : mid;
+      lo = mid + 1;
+    } else {
+      // This tile starts at/after the viewport; it's a candidate, but an
+      // earlier tile may also qualify (its end may still reach minWorldX).
+      result = mid;
+      hi = mid - 1;
+    }
+  }
+  return Math.max(0, Math.min(result, nCols - 1));
+}
+
+/**
+ * Binary search for the last tile column (at the given level) whose world-X
+ * end is <= ``maxWorldX``. Returns a column index in [0, nCols-1].
+ */
+function _findLastTileColInViewport(
+  layout: SpatialLayout,
+  maxWorldX: number,
+  tile: number,
+  downsample: number,
+  w: number,
+): number {
+  const nCols = Math.ceil(w / tile);
+  const totalWorld = layout.totalWorldWidth;
+  if (maxWorldX >= totalWorld) return nCols - 1;
+  let lo = 0;
+  let hi = nCols - 1;
+  let result = nCols - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const endCol = (mid + 1) * tile * downsample;
+    const x1 = layout.mapColToWorldX(Math.min(endCol, layout.totalRawWidth));
+    if (x1 > maxWorldX) {
+      // This tile ends after the viewport; the answer is at or before mid.
+      result = mid - 1 >= 0 ? mid - 1 : mid;
+      hi = mid - 1;
+    } else {
+      // This tile ends at/before the viewport; it's a candidate, but a later
+      // tile may also qualify (its start may still be <= maxWorldX).
+      result = mid;
+      lo = mid + 1;
+    }
+  }
+  return Math.max(0, Math.min(result, nCols - 1));
 }
 
 /**

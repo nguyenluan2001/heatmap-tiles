@@ -31,9 +31,10 @@ export interface GroupConfig {
 export class SpatialLayout {
   /** Raw index where each group starts (no gaps): 0, size0, size0+size1, ... */
   groupRawStarts: number[] = [];
-  /** World X where each group starts (with gaps): 0, s0+gap, s0+s1+2*gap, ... */
+  /** World X where each group starts (with gaps, RELATIVE to originX):
+   *  0-originX, s0+gap-originX, s0+s1+2*gap-originX, ... */
   groupWorldStarts: number[] = [];
-  /** Total world width including all inter-cluster gaps. */
+  /** Total world width including all inter-cluster gaps (RELATIVE to originX). */
   totalWorldWidth: number = 0;
   /** Total number of cells (sum of group sizes, no gaps). */
   totalRawWidth: number = 0;
@@ -43,22 +44,31 @@ export class SpatialLayout {
   groups: GroupConfig[];
   /** Gap size in world units between consecutive clusters. */
   gapSize: number;
+  /** X origin offset for RTC (Relative-To-Center) precision. All world-X
+   *  values returned by {@link mapColToWorldX} are relative to this origin,
+   *  keeping them small (< viewport) so Float32 GPU precision is sufficient
+   *  even for 20M+ cells. Default 0 = absolute coordinates (backward compat). */
+  originX: number;
 
-  constructor(groups: GroupConfig[], gapSize: number) {
+  constructor(groups: GroupConfig[], gapSize: number, originX: number = 0) {
     this.groups = groups;
     this.gapSize = gapSize;
+    this.originX = originX;
     let rawX = 0;
     let worldX = 0;
     for (const group of groups) {
       this.groupRawStarts.push(rawX);
-      this.groupWorldStarts.push(worldX);
+      // Store RELATIVE world starts (subtract originX) so all downstream
+      // world-X values are small and Float32-safe.
+      this.groupWorldStarts.push(worldX - originX);
       rawX += group.size;
       worldX += group.size + gapSize;
     }
     this.totalRawWidth = rawX;
     // The last gap is trailing whitespace; subtract it so the world width
     // exactly spans the data + inter-cluster gaps (no trailing gap).
-    this.totalWorldWidth = Math.max(0, worldX - gapSize);
+    // Result is RELATIVE to originX.
+    this.totalWorldWidth = Math.max(0, worldX - gapSize - originX);
     this.nGroups = groups.length;
   }
 

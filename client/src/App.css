@@ -479,3 +479,59 @@ body {
   height: 14px;
   border-radius: 2px;
 }
+
+/* ---------------------------------------------------------------- */
+/* Box-select-to-zoom                                                */
+/* ---------------------------------------------------------------- */
+
+/* The overlay covers the entire canvas and captures mouse events when
+   box-select mode is active. It sits above the deck.gl canvas but below
+   the control panels (z-index 15 < 20). */
+.box-select-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  cursor: crosshair;
+}
+
+/* The drag rectangle shown while the user is selecting a region. */
+.box-select-rect {
+  position: absolute;
+  border: 1.5px solid var(--accent);
+  background: rgba(88, 166, 255, 0.12);
+  pointer-events: none;
+  box-shadow: 0 0 0 1px rgba(13, 17, 23, 0.5);
+}
+
+/* Hint text shown in the top-center of the overlay. */
+.box-select-hint {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(22, 27, 34, 0.9);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+  white-space: nowrap;
+}
+
+/* The toggle button in the gene toolbar. */
+.gt-box {
+  background: #30363d;
+  color: var(--text);
+  margin-left: auto;
+}
+
+.gt-box:hover {
+  opacity: 0.85;
+}
+
+.gt-box.active {
+  background: var(--accent);
+  color: #0d1117;
+}

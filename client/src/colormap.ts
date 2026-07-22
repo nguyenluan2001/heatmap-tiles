@@ -6,7 +6,7 @@
  * palette and provide CSS colours for the legend / colour bar.
  */
 
-export type PaletteName = "viridis" | "magma" | "plasma" | "inferno";
+export type PaletteName = "viridis" | "magma" | "plasma" | "inferno" | "YlOrRd";
 
 /** RGB control-point stops for each palette (matching matplotlib). */
 const PALETTE_STOPS: Record<PaletteName, [number, number, number][]> = {
@@ -55,9 +55,21 @@ const PALETTE_STOPS: Record<PaletteName, [number, number, number][]> = {
     [249, 201, 50],
     [252, 255, 164],
   ],
+  YlOrRd: [
+    [255, 255, 204],
+    [255, 237, 160],
+    [254, 217, 118],
+    [254, 178, 76],
+    [253, 141, 60],
+    [252, 78, 42],
+    [227, 26, 28],
+    [189, 0, 38],
+    [128, 0, 38],
+  ],
 };
 
 export const PALETTE_NAMES: PaletteName[] = [
+  "YlOrRd",
   "viridis",
   "magma",
   "plasma",

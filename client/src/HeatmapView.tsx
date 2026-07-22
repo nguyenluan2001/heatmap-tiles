@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import DeckGL from "@deck.gl/react";
 import type { DeckGLRef } from "@deck.gl/react";
 import { DynamicTexture } from "@luma.gl/engine";
 import type { Texture } from "@luma.gl/core";
 import {
+  COORDINATE_SYSTEM,
   OrthographicView,
   OrthographicController,
   type OrthographicViewState,
@@ -12,11 +14,13 @@ import {
 import {
   fetchMeta,
   fetchObs,
+  fetchObsRange,
   fetchVar,
   fetchGroups,
   fetchCustomVar,
   createCustomPyramid,
   customTileUrl,
+  setUseDynamicTiles,
   type PyramidMeta,
   type ObsData,
   type CustomPyramidResponse,
@@ -38,6 +42,21 @@ import {
   type PaletteName,
 } from "./colormap";
 import GenePicker from "./GenePicker";
+
+/**
+ * Threshold (in number of cells) above which the full /api/obs endpoint is
+ * disabled and the frontend switches to lazy range-based fetching
+ * (/api/obs/range). Must match the backend OBS_FULL_THRESHOLD. Prevents
+ * browser OOM for large datasets (20M+ cells).
+ */
+const OBS_FULL_THRESHOLD = 1_000_000;
+
+/**
+ * Only show cell-name axis labels when fewer than this many cells are visible
+ * in the viewport. With 20M cells, labelling every cell at a zoomed-out view
+ * is both unreadable and would fetch megabytes of string data.
+ */
+const VISIBLE_CELL_LABEL_THRESHOLD = 5000;
 
 /**
  * Interactive heatmap visualiser.
@@ -70,7 +89,24 @@ export default function HeatmapView() {
   // gap is in world units (1 unit = 1 cell at level 0); ~2% of the cell
   // count gives a clear but compact split.
   const [gapSize, setGapSize] = useState(8);
-  const [palette, setPalette] = useState<PaletteName>("viridis");
+  const [palette, setPalette] = useState<PaletteName>("YlOrRd");
+
+  // --- Box-select-to-zoom ---
+  // When enabled, the user drags a rectangle on the canvas; on release the
+  // viewport zooms to fit that rectangle's world bounds. While dragging,
+  // a semi-transparent rectangle is shown as visual feedback.
+  const [boxSelectMode, setBoxSelectMode] = useState(false);
+  // The drag rectangle in SCREEN pixels (relative to the wrap container).
+  const [boxRect, setBoxRect] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null>(null);
+  // Refs to track the drag start point and whether we're actively dragging.
+  const boxDragStart = useRef<{ x: number; y: number } | null>(null);
+  const boxDragging = useRef(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
 
   // The deck.gl ref gives us access to the luma.gl device for creating the
   // colour LUT texture.
@@ -82,19 +118,20 @@ export default function HeatmapView() {
     let cancelled = false;
     fetchMeta()
       .then((m) => {
-        if (!cancelled) setMeta(m);
+        if (cancelled) return;
+        setMeta(m);
+        // Always use the dynamic zarr-backed tile endpoint (/api/tile/...).
+        // The backend now renders tiles on-the-fly with a disk LRU cache,
+        // so static PNG pre-rendering is no longer needed (and infeasible for
+        // large datasets). Static tiles are only used if the backend sets
+        // HEATMAP_STATIC_TILES=1 AND the dataset is small enough.
+        setUseDynamicTiles(true);
       })
       .catch((e) => {
         if (!cancelled) setError(e?.message ?? String(e));
       });
-    // Fetch cell + gene names for axis labels (in parallel).
-    fetchObs()
-      .then((o) => {
-        if (!cancelled) setObs(o);
-      })
-      .catch(() => {
-        /* labels are optional */
-      });
+    // Fetch gene names + cluster groups (these are small even at 20M cells:
+    // ~20K genes, a few hundred cluster groups).
     fetchVar()
       .then((v) => {
         if (!cancelled) setVarNames(v.var_names);
@@ -108,6 +145,15 @@ export default function HeatmapView() {
       })
       .catch(() => {
         /* groups are optional */
+      });
+    // Cell metadata (obs): for small datasets fetch all at once; for large
+    // datasets the lazy range-based fetch in the viewport effect handles it.
+    fetchObs()
+      .then((o) => {
+        if (!cancelled) setObs(o);
+      })
+      .catch(() => {
+        // Expected to fail (413) for large datasets — lazy fetch takes over.
       });
     return () => {
       cancelled = true;
@@ -187,7 +233,7 @@ export default function HeatmapView() {
   const [viewState, setViewState] = useState<OrthographicViewState>({
     target: [0, 0, 0],
     zoom: 0,
-    minZoom: -3,
+    minZoom: -20,
     maxZoom: 10,
   });
   // Guard so the initial fit runs only once per pyramid (full / custom),
@@ -206,16 +252,39 @@ export default function HeatmapView() {
     return [];
   }, [custom, groups, meta]);
 
+  // Absolute world width (cells, X axis) with gaps — the true data span, used
+  // for fitting the viewport and computing the RTC origin.
+  const absWorldWidth = useMemo(() => {
+    let w = 0;
+    for (const g of activeGroups) w += g.size + gapSize;
+    return Math.max(0, w - gapSize); // subtract trailing gap
+  }, [activeGroups, gapSize]);
+
+  // RTC (Relative-To-Center) origin: for large datasets (>= 20M cells) the
+  // absolute X coordinates exceed Float32 precision (2^24 = 16.7M), causing
+  // pixel jitter. We offset all X coordinates by the matrix center so the
+  // GPU only ever sees small relative values (±absWorldWidth/2 < 16.7M for
+  // 20M cells). For small datasets, originX = 0 (absolute coords, unchanged).
+  const needsRTC = (meta?.n_cells ?? 0) >= OBS_FULL_THRESHOLD;
+  const originX = needsRTC ? absWorldWidth / 2 : 0;
+
   // Build the SpatialLayout from the active groups + current gap size.
+  // When originX > 0, all world-X values returned are relative to originX.
   const layout = useMemo(
-    () => new SpatialLayout(activeGroups, gapSize),
-    [activeGroups, gapSize],
+    () => new SpatialLayout(activeGroups, gapSize, originX),
+    [activeGroups, gapSize, originX],
   );
 
   // Total world width (cells, X axis) with gaps for fitting the viewport.
-  // World height (Y axis) = number of genes.
-  const worldWidth = layout.totalWorldWidth || meta?.n_cells || 1;
-  const worldHeight = meta?.n_genes || 1;
+  // Use the absolute width for fitting (the actual data span); the layout's
+  // totalWorldWidth is relative when RTC is active.
+  // World height (Y axis) = number of genes. When n_genes < TILE_SIZE, the
+  // tile is NaN-padded and the GPU shader stretches the data to fill the full
+  // tile (256 world units). So the visual height is max(n_genes, TILE_SIZE).
+  const TILE = meta?.tile_size ?? 256;
+  const worldWidth = absWorldWidth || meta?.n_cells || 1;
+  const rawGenes = meta?.n_genes || 1;
+  const worldHeight = rawGenes < TILE ? TILE : rawGenes;
   // Reserve space above the matrix for cluster annotation brackets + labels
   // (they live at negative Y). Add a top margin proportional to the gene
   // count so the fit zoom leaves room for them.
@@ -232,19 +301,38 @@ export default function HeatmapView() {
     if (didInitialFitRef.current === fitKey) return;
     didInitialFitRef.current = fitKey;
     const fitWorldH = worldHeight + annotationMargin;
-    const fitZoom = Math.log2(
+    let fitZoom = Math.log2(
       Math.min(size.width / worldWidth, size.height / fitWorldH),
     );
+    // When very few genes are selected (custom pyramid), the tile is padded
+    // and stretched (dataExtent), so each visual gene row is TILE/n_genes
+    // world units tall. Clamp the zoom so each visual gene row is at most
+    // ~150px on screen — this keeps gene labels from overlapping.
+    const nGenes = meta.n_genes;
+    if (nGenes > 0 && nGenes <= 50) {
+      const visualGeneHeight = nGenes < TILE ? TILE / nGenes : 1;
+      const maxPxPerGene = 150;
+      const pxPerWorldUnit = maxPxPerGene / visualGeneHeight;
+      const minZoomForGenes = Math.log2(pxPerWorldUnit);
+      fitZoom = Math.max(fitZoom, minZoomForGenes);
+    }
+    // Target is RELATIVE to originX when RTC is active, so the view stays
+    // centered near [0, 0] and Float32 precision is preserved.
     setViewState((vs: OrthographicViewState) => ({
       ...vs,
-      target: [worldWidth / 2, (worldHeight - annotationMargin) / 2, 0],
+      target: [
+        worldWidth / 2 - originX,
+        (worldHeight - annotationMargin) / 2,
+        0,
+      ],
       zoom: fitZoom,
     }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta, activeGroups, fitKey]);
+  }, [meta, activeGroups, fitKey, originX]);
+  console.log("viewState===", viewState);
 
   // Track the container size so we can compute visible tiles.
-  const wrapRef = useRef<HTMLDivElement>(null);
+  // (wrapRef is declared above with the box-select state.)
   useEffect(() => {
     if (!wrapRef.current) return;
     const ro = new ResizeObserver((entries) => {
@@ -280,6 +368,7 @@ export default function HeatmapView() {
       size.height,
       layout,
     );
+    console.log("🚀 ===== HeatmapView ===== tiles:", tiles);
     // Use custom tile URL + id prefix when in custom mode.
     const urlFn = custom
       ? (l: number, r: number, c: number) => customTileUrl(custom.id, l, r, c)
@@ -299,13 +388,13 @@ export default function HeatmapView() {
     const axisLayers =
       cellIds.length || genes.length
         ? createAxisLayers(
-          activeMeta,
-          cellIds,
-          genes,
-          zoom,
-          size.width,
-          size.height,
-        )
+            activeMeta,
+            cellIds,
+            genes,
+            zoom,
+            size.width,
+            size.height,
+          )
         : [];
     // Cluster annotation ticks + labels above the heatmap, positioned
     // via the SpatialLayout so they line up with the cluster-gap split.
@@ -340,6 +429,60 @@ export default function HeatmapView() {
 
   // (The initial fit above already handles full/custom switching via the
   // fitKey guard, so no separate re-fit effect is needed here.)
+
+  // Lazy cell-metadata fetch (Phase 8 of the 20M-cell plan).
+  // For large datasets the full /api/obs is disabled (would OOM the browser),
+  // so we fetch only the cell metadata for the cells currently visible in the
+  // viewport, and only when few enough cells are visible that labels are
+  // readable. This keeps browser memory bounded regardless of dataset size.
+  const lastObsRangeRef = useRef<string>("");
+  useEffect(() => {
+    if (!activeMeta) return;
+    // Only lazy-fetch for large datasets; small datasets already have full obs.
+    if (activeMeta.n_cells < OBS_FULL_THRESHOLD) return;
+    const zoom = Number(viewState.zoom ?? 0);
+    const target = viewState.target as [number, number, number];
+    const visW = size.width / Math.pow(2, zoom);
+    const west = target[0] - visW / 2;
+    const east = target[0] + visW / 2;
+    // Convert world-X bounds back to raw cell indices (account for gaps).
+    let startCol: number;
+    let endCol: number;
+    if (layout && layout.gapSize > 0) {
+      startCol = Math.max(0, layout.mapWorldXToCol(west));
+      endCol = Math.min(activeMeta.n_cells, layout.mapWorldXToCol(east) + 1);
+    } else {
+      startCol = Math.max(0, Math.floor(west));
+      endCol = Math.min(activeMeta.n_cells, Math.ceil(east));
+    }
+    if (startCol < 0) startCol = 0;
+    if (endCol <= startCol) {
+      setObs(null);
+      return;
+    }
+    const nVisible = endCol - startCol;
+    // Too many cells visible — labels would be unreadable + heavy. Clear obs.
+    if (nVisible > VISIBLE_CELL_LABEL_THRESHOLD) {
+      setObs(null);
+      lastObsRangeRef.current = "";
+      return;
+    }
+    // Dedup: skip refetch if the range hasn't changed.
+    const rangeKey = `${startCol}-${endCol}`;
+    if (rangeKey === lastObsRangeRef.current) return;
+    lastObsRangeRef.current = rangeKey;
+    let cancelled = false;
+    fetchObsRange(startCol, endCol)
+      .then((o) => {
+        if (!cancelled) setObs(o);
+      })
+      .catch(() => {
+        /* labels are optional */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeMeta, viewState, size, layout]);
 
   // --- Gene picker handlers ---
   const toggleGene = useCallback((index: number) => {
@@ -393,6 +536,124 @@ export default function HeatmapView() {
     [],
   );
 
+  // --- Box-select-to-zoom handlers ---
+  // Convert screen pixels (relative to the wrap container) to world coords
+  // using the current viewState. This mirrors deck.gl's OrthographicView
+  // projection: world = (screen - viewport_center) / 2^zoom + target.
+  const screenToWorld = useCallback(
+    (sx: number, sy: number): [number, number] => {
+      const zoom = Number(viewState.zoom ?? 0);
+      const [tx, ty] = viewState.target as [number, number, number];
+      const scale = Math.pow(2, zoom);
+      // Screen coords are relative to the wrap container's top-left.
+      // deck.gl centers the view, so viewport center = size/2.
+      const wx = (sx - size.width / 2) / scale + tx;
+      const wy = (sy - size.height / 2) / scale + ty;
+      return [wx, wy];
+    },
+    [viewState, size],
+  );
+
+  // Mouse down on the canvas overlay: start dragging (only in box-select mode).
+  const onBoxMouseDown = useCallback(
+    (e: ReactMouseEvent<HTMLDivElement>) => {
+      if (!boxSelectMode || !wrapRef.current) return;
+      // Only start on left button (button 0).
+      if (e.button !== 0) return;
+      const rect = wrapRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      boxDragStart.current = { x, y };
+      boxDragging.current = true;
+      setBoxRect({ x, y, w: 0, h: 0 });
+      e.preventDefault();
+      e.stopPropagation();
+    },
+    [boxSelectMode],
+  );
+
+  // Mouse move while dragging: update the rectangle.
+  const onBoxMouseMove = useCallback((e: ReactMouseEvent<HTMLDivElement>) => {
+    if (!boxDragging.current || !boxDragStart.current || !wrapRef.current)
+      return;
+    const rect = wrapRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const sx = boxDragStart.current.x;
+    const sy = boxDragStart.current.y;
+    setBoxRect({
+      x: Math.min(sx, x),
+      y: Math.min(sy, y),
+      w: Math.abs(x - sx),
+      h: Math.abs(y - sy),
+    });
+  }, []);
+
+  // Mouse up: finish dragging, zoom to the selected rectangle.
+  const onBoxMouseUp = useCallback(
+    (e: ReactMouseEvent<HTMLDivElement>) => {
+      if (!boxDragging.current || !boxDragStart.current || !wrapRef.current) {
+        boxDragging.current = false;
+        boxDragStart.current = null;
+        return;
+      }
+      boxDragging.current = false;
+      const rect = wrapRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const sx = boxDragStart.current.x;
+      const sy = boxDragStart.current.y;
+      boxDragStart.current = null;
+      setBoxRect(null);
+
+      const w = Math.abs(x - sx);
+      const h = Math.abs(y - sy);
+      // Ignore tiny drags (clicks) — don't zoom.
+      if (w < 5 || h < 5) return;
+
+      // Convert the rectangle corners from screen to world coords.
+      const [wx0, wy0] = screenToWorld(Math.min(sx, x), Math.min(sy, y));
+      const [wx1, wy1] = screenToWorld(Math.max(sx, x), Math.max(sy, y));
+      const worldW = wx1 - wx0;
+      const worldH = wy1 - wy0;
+      if (worldW <= 0 || worldH <= 0) return;
+
+      // Fit the selected region: zoom so the region fills the viewport.
+      const newZoom = Math.log2(
+        Math.min(size.width / worldW, size.height / worldH),
+      );
+      const cx = (wx0 + wx1) / 2;
+      const cy = (wy0 + wy1) / 2;
+
+      // Clamp zoom for few-gene custom pyramids (same logic as onViewStateChange).
+      const nGenes = activeMeta?.n_genes ?? 0;
+      const tileSize = activeMeta?.tile_size ?? 256;
+      let clampedZoom = newZoom;
+      if (nGenes > 0 && nGenes <= 50) {
+        const visualGeneHeight = nGenes < tileSize ? tileSize / nGenes : 1;
+        const minPxPerWorldUnit = 20 / visualGeneHeight;
+        const minZoom = Math.log2(minPxPerWorldUnit);
+        if (clampedZoom < minZoom) clampedZoom = minZoom;
+      }
+
+      setViewState((vs) => ({
+        ...vs,
+        target: [cx, cy, 0],
+        zoom: clampedZoom,
+      }));
+    },
+    [screenToWorld, size, activeMeta],
+  );
+
+  // If the user exits the container while dragging, cancel.
+  const onBoxMouseLeave = useCallback(() => {
+    if (boxDragging.current) {
+      boxDragging.current = false;
+      boxDragStart.current = null;
+      setBoxRect(null);
+    }
+  }, []);
+
   if (error) {
     return (
       <div className="loading">
@@ -413,15 +674,74 @@ export default function HeatmapView() {
     <div className="heatmap-wrap" ref={wrapRef}>
       <DeckGL
         ref={deckRef}
-        views={new OrthographicView({ id: "ortho", controller: true })}
+        views={
+          // RTC: shift the coordinate system origin so GPU Float32 values
+          // stay small (< 16.7M) even for 20M+ cells. When originX = 0
+          // (small datasets) this is a no-op. coordinateOrigin /
+          // coordinateSystem are valid deck.gl View props but not in the
+          // OrthographicViewProps TS types, hence the cast.
+          new OrthographicView({
+            id: "ortho",
+            // Disable deck.gl's built-in panning when in box-select mode so
+            // the drag is captured by our overlay instead of the controller.
+            controller: boxSelectMode
+              ? { dragPan: false, dragRotate: false, keyboard: false }
+              : true,
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            coordinateOrigin: [originX, 0, 0],
+          } as any)
+        }
         viewState={viewState}
         controller={OrthographicController}
         layers={layers}
-        onViewStateChange={(e) =>
-          setViewState(e.viewState as OrthographicViewState)
-        }
+        onViewStateChange={(e) => {
+          const vs = e.viewState as OrthographicViewState;
+          // When few genes are selected, prevent zooming out so far that
+          // gene labels overlap. Each gene row should be at least ~20px
+          // tall on screen (2^zoom >= 20 → zoom >= log2(20) ≈ 4.3).
+          const nGenes = activeMeta?.n_genes ?? 0;
+          const tileSize = activeMeta?.tile_size ?? 256;
+          if (nGenes > 0 && nGenes <= 50) {
+            // Each visual gene row is tileSize/nGenes world units tall
+            // (due to dataExtent stretching). Require at least 20px per row.
+            const visualGeneHeight = nGenes < tileSize ? tileSize / nGenes : 1;
+            const minPxPerWorldUnit = 20 / visualGeneHeight;
+            const minZoom = Math.log2(minPxPerWorldUnit);
+            const z = Number(vs.zoom ?? 0);
+            if (z < minZoom) {
+              vs.zoom = minZoom;
+            }
+          }
+          setViewState(vs);
+        }}
         onHover={onHover as any}
       />
+      {/* Box-select overlay: captures mouse events when in box-select mode.
+          Sits above the deck.gl canvas but below the controls. */}
+      {boxSelectMode && (
+        <div
+          className="box-select-overlay"
+          onMouseDown={onBoxMouseDown}
+          onMouseMove={onBoxMouseMove}
+          onMouseUp={onBoxMouseUp}
+          onMouseLeave={onBoxMouseLeave}
+        >
+          {boxRect && (
+            <div
+              className="box-select-rect"
+              style={{
+                left: boxRect.x,
+                top: boxRect.y,
+                width: boxRect.w,
+                height: boxRect.h,
+              }}
+            />
+          )}
+          <div className="box-select-hint">
+            Drag to select a region to zoom in
+          </div>
+        </div>
+      )}
       {/* Gene selection toolbar */}
       <div className="gene-toolbar">
         {custom ? (
@@ -439,6 +759,13 @@ export default function HeatmapView() {
             Select genes…
           </button>
         )}
+        <button
+          className={`gt-btn gt-box${boxSelectMode ? " active" : ""}`}
+          onClick={() => setBoxSelectMode((v) => !v)}
+          title="Toggle box-select-to-zoom"
+        >
+          {boxSelectMode ? "▢ Select… ON" : "▢ Select region"}
+        </button>
       </div>
       {/* Cluster gap + palette controls */}
       <div className="controls">
@@ -526,8 +853,8 @@ function Tooltip({
         {col}
       </div>
       <div>
-        <span className="tt-label">Bounds:</span> [{x0.toFixed(0)}, {y0.toFixed(0)}]
-        → [{x1.toFixed(0)}, {y1.toFixed(0)}]
+        <span className="tt-label">Bounds:</span> [{x0.toFixed(0)},{" "}
+        {y0.toFixed(0)}] → [{x1.toFixed(0)}, {y1.toFixed(0)}]
       </div>
       <div>
         <span className="tt-label">Size:</span> {(x1 - x0).toFixed(0)} ×{" "}

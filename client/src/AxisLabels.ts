@@ -177,11 +177,24 @@ export function createAxisLayers(
 
   // --- Y axis: gene names (left side) ---
   // Genes are along the Y axis (rows).
-  const geneStride = Math.max(1, Math.round(TARGET_SPACING / pxPerUnit));
+  // When few genes are selected (custom pyramid), always show ALL of them
+  // regardless of zoom — the stride would otherwise skip most of them.
+  const geneStride =
+    varNames.length <= 50
+      ? 1
+      : Math.max(1, Math.round(TARGET_SPACING / pxPerUnit));
   const geneData: { position: [number, number]; text: string }[] = [];
+  // When n_genes < TILE_SIZE, the tile is padded with NaN and the GPU shader
+  // stretches the data rows (vExtent) to fill the full 256-pixel tile. So
+  // gene j visually occupies the range [j, j+1) * (TILE_SIZE / n_genes) in
+  // world coordinates. Labels must match this stretched layout.
+  const nGenes = meta.n_genes;
+  const TILE = meta.tile_size;
+  const geneScale = nGenes > 0 && nGenes < TILE ? TILE / nGenes : 1;
   for (let j = 0; j < varNames.length; j += geneStride) {
+    const yPos = (j + 0.5) * geneScale;
     geneData.push({
-      position: [-2, j + 0.5], // just left of the matrix, centred on the row
+      position: [-2, yPos], // just left of the matrix, centred on the row
       text: varNames[j],
     });
   }
@@ -192,7 +205,8 @@ export function createAxisLayers(
   // X axis: cell names along the bottom, rotated -90° so they read downward.
   const cellLayer = new TextLayer({
     id: "axis-x-cells",
-    data: cellData,
+    // data: cellData,
+    data: [],
     getPosition: (d: { position: [number, number] }) => d.position,
     getText: (d: { text: string }) => d.text,
     size: fontSize,

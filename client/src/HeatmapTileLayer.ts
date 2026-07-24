@@ -3,14 +3,11 @@ import { PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
 
 import { GroupedHeatmapLayer } from "./GroupedHeatmapLayer";
 import { SpatialLayout } from "./SpatialLayout";
-import { tileUrl } from "./api";
 import type { PyramidMeta } from "./api";
+import { TileLoader } from "./TileLoader";
 
 /** App background colour (matches --bg in App.css) used to mask gap regions. */
 const GAP_MASK_COLOR: [number, number, number, number] = [13, 17, 23, 255];
-
-/** Function that builds a tile PNG URL from (level, row, col). */
-export type TileUrlFn = (level: number, row: number, col: number) => string;
 
 /** A single visible tile with its world-space bounds (4 corners) and data extent.
  *
@@ -279,19 +276,37 @@ function _findLastTileColInViewport(
  * loads its grayscale PNG tile and maps it through the shared colour LUT
  * texture on the GPU. The LUT texture is shared across all tiles so palette
  * switching is instant.
+ *
+ * Tiles are fetched via POST (see {@link TileLoader}). Since deck.gl's
+ * BitmapLayer `image` prop accepts a URL string, we use the TileLoader's
+ * `getSync()` to return a cached blob URL synchronously during render. If the
+ * tile isn't cached yet, `getSync` returns null (and triggers an async fetch);
+ * the layer is created with `image: null` so deck.gl skips drawing it. When
+ * the fetch completes, the TileLoader's `onLoad` callback triggers a React
+ * re-render, and the next render picks up the now-cached blob URL.
  */
 export function createTileLayers(
   tiles: VisibleTile[],
   colorMapLUT: Texture,
-  urlFn: TileUrlFn = tileUrl,
+  tileLoader: TileLoader,
   idPrefix = "tile",
 ) {
   return tiles.map((t) => {
+    // Synchronously get the cached blob URL, or null if not yet loaded.
+    // getSync triggers an async fetch when the tile is not cached, so the
+    // next render (fired by the onLoad callback) will have the URL available.
+    const imageUrl = tileLoader.getSync({
+      level: t.level,
+      row: t.row,
+      col: t.col,
+    });
     // `colorMapLUT` is a custom prop on GroupedHeatmapLayer; cast the props
     // object so TypeScript accepts the extended property set.
     const props = {
       id: `${idPrefix}-${t.level}-${t.row}-${t.col}`,
-      image: urlFn(t.level, t.row, t.col),
+      // null when not yet loaded → deck.gl skips drawing this layer until
+      // the blob URL is available (after the next re-render).
+      image: imageUrl,
       bounds: t.bounds,
       colorMapLUT,
       // Data extent (fraction of the 256px texture holding real data) so the

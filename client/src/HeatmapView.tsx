@@ -12,6 +12,7 @@ import {
 } from "@deck.gl/core";
 
 import {
+  fetchDatasets,
   fetchMeta,
   fetchObs,
   fetchObsRange,
@@ -19,12 +20,15 @@ import {
   fetchGroups,
   fetchCustomVar,
   createCustomPyramid,
-  customTileUrl,
+  fetchTileArrayBuffer,
+  fetchCustomTileArrayBuffer,
   setUseDynamicTiles,
+  setDatasetId,
   type PyramidMeta,
   type ObsData,
   type CustomPyramidResponse,
   type GroupConfig,
+  type DatasetInfo,
 } from "./api";
 import {
   computeVisibleTiles,
@@ -33,6 +37,7 @@ import {
   createTileBorderLayer,
   type VisibleTile,
 } from "./HeatmapTileLayer";
+import { TileLoader } from "./TileLoader";
 import { createAxisLayers, createClusterAnnotationLayers } from "./AxisLabels";
 import { SpatialLayout } from "./SpatialLayout";
 import {
@@ -68,6 +73,10 @@ const VISIBLE_CELL_LABEL_THRESHOLD = 5000;
  * adjusting the cluster gap size are instant.
  */
 export default function HeatmapView() {
+  // --- Dataset selector (multi-heatmap via PyramidRegistry) ---
+  const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
+  const [activeDatasetId, setActiveDatasetId] = useState<string | null>(null);
+
   const [meta, setMeta] = useState<PyramidMeta | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 800, height: 600 });
@@ -114,24 +123,100 @@ export default function HeatmapView() {
   const [lutTexture, setLutTexture] = useState<Texture | null>(null);
   const lutTextureRef = useRef<Texture | null>(null);
 
+  // --- Tile loaders (POST-based blob URL cache for deck.gl) ---
+  // Tiles are fetched via POST and cached as blob URLs (see TileLoader). When
+  // a new tile finishes loading, the onLoad callback bumps tileVersion to
+  // trigger a re-render so deck.gl picks up the newly-available URL on the
+  // next render cycle.
+  const [tileVersion, setTileVersion] = useState(0);
+  const bumpTileVersion = useCallback(() => setTileVersion((v) => v + 1), []);
+
+  // Regular pyramid tile loader (created once, persists for the component's
+  // lifetime). The fetch function adapts the TileParams object to the
+  // positional-arg signature of fetchTileArrayBuffer.
+  const baseTileLoader = useMemo(
+    () =>
+      new TileLoader(
+        (p) => fetchTileArrayBuffer(p.level, p.row, p.col),
+        2000,
+        bumpTileVersion,
+      ),
+    [bumpTileVersion],
+  );
+
+  // Custom pyramid tile loader (recreated when the custom pyramid id changes).
+  // The fetch function closes over custom.id, so it must be rebuilt per
+  // custom pyramid. When null (no custom pyramid), the base loader is used.
+  const customTileLoader = useMemo(
+    () =>
+      custom
+        ? new TileLoader(
+            (p) => fetchCustomTileArrayBuffer(custom.id, p.level, p.row, p.col),
+            2000,
+            bumpTileVersion,
+          )
+        : null,
+    [custom?.id, bumpTileVersion],
+  );
+  // Revoke old custom loader's blob URLs when switching pyramids (frees
+  // memory — each cached PNG is ~256KB).
+  useEffect(() => {
+    return () => {
+      customTileLoader?.clear();
+    };
+  }, [customTileLoader]);
+
+  // The active loader: custom when in custom mode, base otherwise. The
+  // nullish-coalescing ensures we always have a loader even if the custom
+  // loader hasn't been created yet (edge case on first render).
+  const tileLoader = customTileLoader ?? baseTileLoader;
+
+  // Fetch the list of available datasets on mount, then load the default.
   useEffect(() => {
     let cancelled = false;
+    fetchDatasets()
+      .then((res) => {
+        if (cancelled) return;
+        setDatasets(res.datasets);
+        // Auto-select the first dataset (or "default" if present).
+        const first =
+          res.datasets.find((d) => d.id === "default") ?? res.datasets[0];
+        if (first) {
+          setActiveDatasetId(first.id);
+          setDatasetId(first.id);
+        }
+      })
+      .catch(() => {
+        // If datasets endpoint fails, fall back to default (null = "default").
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load all metadata for the active dataset. Re-runs when the user switches
+  // datasets (activeDatasetId changes). Clears old state first so stale
+  // labels from the previous dataset don't flash on screen.
+  useEffect(() => {
+    if (activeDatasetId === null) return; // wait for dataset list to load
+    let cancelled = false;
+    setMeta(null);
+    setObs(null);
+    setVarNames(null);
+    setGroups([]);
+    setCustom(null);
+    setCustomVarNames(null);
+    // Clear the tile loader cache so tiles from the old dataset don't show.
+    baseTileLoader.clear();
     fetchMeta()
       .then((m) => {
         if (cancelled) return;
         setMeta(m);
-        // Always use the dynamic zarr-backed tile endpoint (/api/tile/...).
-        // The backend now renders tiles on-the-fly with a disk LRU cache,
-        // so static PNG pre-rendering is no longer needed (and infeasible for
-        // large datasets). Static tiles are only used if the backend sets
-        // HEATMAP_STATIC_TILES=1 AND the dataset is small enough.
         setUseDynamicTiles(true);
       })
       .catch((e) => {
         if (!cancelled) setError(e?.message ?? String(e));
       });
-    // Fetch gene names + cluster groups (these are small even at 20M cells:
-    // ~20K genes, a few hundred cluster groups).
     fetchVar()
       .then((v) => {
         if (!cancelled) setVarNames(v.var_names);
@@ -146,8 +231,6 @@ export default function HeatmapView() {
       .catch(() => {
         /* groups are optional */
       });
-    // Cell metadata (obs): for small datasets fetch all at once; for large
-    // datasets the lazy range-based fetch in the viewport effect handles it.
     fetchObs()
       .then((o) => {
         if (!cancelled) setObs(o);
@@ -158,6 +241,12 @@ export default function HeatmapView() {
     return () => {
       cancelled = true;
     };
+  }, [activeDatasetId, baseTileLoader]);
+
+  // Switch to a different dataset (called by the <select> dropdown).
+  const switchDataset = useCallback((id: string) => {
+    setActiveDatasetId(id);
+    setDatasetId(id);
   }, []);
 
   // Create / recreate the colour LUT texture whenever the palette changes or
@@ -369,14 +458,13 @@ export default function HeatmapView() {
       layout,
     );
     console.log("🚀 ===== HeatmapView ===== tiles:", tiles);
-    // Use custom tile URL + id prefix when in custom mode.
-    const urlFn = custom
-      ? (l: number, r: number, c: number) => customTileUrl(custom.id, l, r, c)
-      : undefined;
+    // Tiles are fetched via POST and cached as blob URLs by the TileLoader.
+    // The active loader (custom vs base) was selected above; pass it to
+    // createTileLayers which calls getSync() per tile.
     const tileLayers = createTileLayers(
       tiles,
       lutTexture,
-      urlFn,
+      tileLoader,
       custom ? "ctile" : "tile",
     );
     // Opaque mask rectangles over the inter-cluster gaps, drawn ON TOP of
@@ -425,6 +513,8 @@ export default function HeatmapView() {
     lutTexture,
     layout,
     activeGroups,
+    tileLoader,
+    tileVersion,
   ]);
 
   // (The initial fit above already handles full/custom switching via the
@@ -767,8 +857,26 @@ export default function HeatmapView() {
           {boxSelectMode ? "▢ Select… ON" : "▢ Select region"}
         </button>
       </div>
-      {/* Cluster gap + palette controls */}
+      {/* Dataset selector + cluster gap + palette controls */}
       <div className="controls">
+        {datasets.length > 1 && (
+          <div className="ctrl-row">
+            <label className="ctrl-label" title="Select heatmap dataset">
+              Dataset
+            </label>
+            <select
+              className="dataset-select"
+              value={activeDatasetId ?? ""}
+              onChange={(e) => switchDataset(e.target.value)}
+            >
+              {datasets.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.id}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="ctrl-row">
           <label
             className="ctrl-label"

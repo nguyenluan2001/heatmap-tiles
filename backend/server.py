@@ -1,21 +1,28 @@
-"""FastAPI server that serves heatmap tiles and metadata from a zarr pyramid.
+"""FastAPI server that serves heatmap tiles and metadata from zarr pyramids.
 
-Endoints
---------
-GET  /api/meta                       -> pyramid metadata (dimensions, levels, value range)
-GET  /api/tile/{l}/{r}/{c}            -> PNG tile at pyramid level l, tile row r, col c (dynamic, cached)
-GET  /api/obs                         -> cell labels, louvain, umap (full — small datasets only)
-GET  /api/obs/range?start=&end=        -> cell metadata for a range [start, end) (lazy, large datasets)
-GET  /api/var                         -> gene names
-GET  /api/groups                      -> cluster groups (id + size) for the SpatialLayout
-GET  /api/value/{c}/{g}               -> raw expression value for one cell-gene pair
-GET  /api/cell_order                  -> the cluster permutation array (chunked, lazy)
-POST /api/custom                      -> build a custom sub-matrix pyramid for selected genes
-GET  /api/custom/{id}/meta            -> custom pyramid metadata
-GET  /api/custom/{id}/tile/{l}/{r}/{c} -> custom pyramid tile PNG (dynamic, cached)
-GET  /api/custom/{id}/var             -> custom pyramid gene names
-GET  /api/cache/stats                 -> tile cache statistics
-GET  /tiles/{level}/{row}_{col}.png   -> static pre-rendered grayscale PNG (legacy, small datasets)
+The server manages multiple heatmap datasets via a :class:`PyramidRegistry`.
+Each dataset is a separate zarr pyramid store on disk, identified by a
+``dataset_id``. All client-facing data APIs use POST with a JSON body that
+includes ``dataset_id`` (defaulting to ``"default"`` for backward
+compatibility).
+
+Endpoints (all client-facing data APIs use POST with a JSON body)
+-----------------------------------------------------------------
+POST /api/datasets                   -> list available heatmap datasets
+POST /api/meta                       -> pyramid metadata (dimensions, levels, value range)
+POST /api/tile                       -> PNG tile at pyramid level l, tile row r, col c (dynamic, cached)
+POST /api/obs                        -> cell labels, louvain, umap (full — small datasets only)
+POST /api/obs/range                  -> cell metadata for a range [start, end) (lazy, large datasets)
+POST /api/var                        -> gene names
+POST /api/groups                     -> cluster groups (id + size) for the SpatialLayout
+POST /api/value                      -> raw expression value for one cell-gene pair
+POST /api/cell_order                 -> the cluster permutation array (chunked, lazy)
+POST /api/custom                     -> build a custom sub-matrix pyramid for selected genes
+POST /api/custom/meta                -> custom pyramid metadata
+POST /api/custom/tile                -> custom pyramid tile PNG (dynamic, cached)
+POST /api/custom/var                 -> custom pyramid gene names
+POST /api/cache/stats                -> tile cache + registry statistics
+GET  /tiles/{level}/{row}_{col}.png  -> static pre-rendered grayscale PNG (legacy, small datasets)
 GET  /                               -> health check
 
 For large datasets (>1M cells) the dynamic zarr-backed endpoints are the
@@ -27,15 +34,15 @@ All tiles are 8-bit grayscale; colour mapping is done on the GPU (Rule #2).
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import zarr
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -49,10 +56,12 @@ try:
         USE_DYNAMIC_TILES,
         ZARR_PATH,
     )
+    from .pyramid_registry import PyramidRegistry, PyramidStore
     from .tile_cache import tile_cache
     from .tile_render import render_tile_png
 except ImportError:  # allow running as a plain script
     from config import HOST, OBS_FULL_THRESHOLD, PORT, TILE_SIZE, USE_DYNAMIC_TILES, ZARR_PATH
+    from pyramid_registry import PyramidRegistry, PyramidStore
     from tile_cache import tile_cache
     from tile_render import render_tile_png
 
@@ -60,7 +69,7 @@ except ImportError:  # allow running as a plain script
 TILES_DIR = Path(os.environ.get("HEATMAP_TILES_DIR", ZARR_PATH.parent / "tiles"))
 STATIC_DATASET_ID = os.environ.get("HEATMAP_DATASET_ID", "default")
 
-app = FastAPI(title="Heatmap Pyramid Server", version="0.2.0")
+app = FastAPI(title="Heatmap Pyramid Server", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,60 +77,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# PyramidRegistry — manages multiple heatmap zarr stores (LRU + TTL)
+# ---------------------------------------------------------------------------
 
-class PyramidStore:
-    """Lazily open the zarr store and cache arrays + metadata."""
-
-    def __init__(self, zarr_path: Path):
-        self.zarr_path = zarr_path
-        self.root: zarr.Group | None = None
-        self.meta: dict | None = None
-        self._arrays: dict[int, zarr.Array] = {}
-
-    def open(self):
-        if self.root is not None:
-            return
-        if not self.zarr_path.exists():
-            raise FileNotFoundError(
-                f"Zarr store not found at {self.zarr_path}. "
-                "Run `python -m backend.build_pyramid` first."
-            )
-        self.root = zarr.open(str(self.zarr_path), mode="r")
-        with open(self.zarr_path / "meta.json") as f:
-            self.meta = json.load(f)
-
-    def array(self, level: int) -> zarr.Array:
-        self.open()
-        if level not in self._arrays:
-            key = f"level_{level}"
-            if key not in self.root:
-                raise KeyError(f"Level {level} not in zarr store")
-            self._arrays[level] = self.root[key]
-        return self._arrays[level]
-
-    def tile(self, level: int, row: int, col: int) -> np.ndarray:
-        """Return a ``(tile_size, tile_size)`` float32 tile, NaN-padded."""
-        arr = self.array(level)
-        h, w = arr.shape
-        # Reject negative or out-of-range tile indices.
-        if row < 0 or col < 0:
-            raise IndexError("tile outside matrix")
-        r0 = row * TILE_SIZE
-        c0 = col * TILE_SIZE
-        if r0 >= h or c0 >= w:
-            raise IndexError("tile outside matrix")
-        r1 = min(r0 + TILE_SIZE, h)
-        c1 = min(c0 + TILE_SIZE, w)
-        block = np.asarray(arr[r0:r1, c0:c1], dtype=np.float32)
-        # Pad to full tile size with NaN so PNGs are uniform.
-        if block.shape != (TILE_SIZE, TILE_SIZE):
-            padded = np.full((TILE_SIZE, TILE_SIZE), np.nan, dtype=np.float32)
-            padded[: r1 - r0, : c1 - c0] = block
-            return padded
-        return block
+registry = PyramidRegistry()
 
 
-_store = PyramidStore(ZARR_PATH)
+@app.on_event("shutdown")
+def _shutdown():
+    """Close all open zarr stores on app shutdown."""
+    registry.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Health + static tiles (legacy)
+# ---------------------------------------------------------------------------
 
 
 @app.get("/")
@@ -132,6 +103,7 @@ def health():
         "tiles_dir": str(TILES_DIR),
         "dynamic_tiles": USE_DYNAMIC_TILES,
         "cache": tile_cache.stats(),
+        "registry": registry.stats(),
     }
 
 
@@ -144,62 +116,109 @@ def get_static_tile(level: int, row: int, col: int):
     return FileResponse(tile_path, media_type="image/png")
 
 
-@app.get("/api/meta")
-def get_meta():
-    _store.open()
-    return _store.meta
+# ---------------------------------------------------------------------------
+# Dataset listing
+# ---------------------------------------------------------------------------
 
 
-def _serve_tile_sync(level: int, row: int, col: int) -> bytes:
+class DatasetsRequest(BaseModel):
+    """Empty body for the datasets endpoint (kept for POST consistency)."""
+
+
+@app.post("/api/datasets")
+def list_datasets(_req: DatasetsRequest = DatasetsRequest()):
+    """List all available heatmap datasets discovered on disk.
+
+    Returns ``{"datasets": [{"id": str, "path": str}, ...]}``.
+    """
+    registry.refresh()
+    return {
+        "datasets": [
+            {"id": ds_id, "path": str(path)} for ds_id, path in sorted(registry._paths.items())
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metadata endpoints (all POST with dataset_id)
+# ---------------------------------------------------------------------------
+
+
+class MetaRequest(BaseModel):
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/meta")
+def get_meta(req: MetaRequest = MetaRequest()):
+    store = registry.get(req.dataset_id)
+    return store.meta
+
+
+def _serve_tile_sync(store: PyramidStore, level: int, row: int, col: int) -> bytes:
     """Render (or fetch from cache) a single tile's PNG bytes."""
-    key = f"t/{level}/{row}/{col}"
-    vmin = float(_store.meta["vmin"])
-    vmax = float(_store.meta["vmax"])
+    ds_id = store.dataset_id
+    key = f"t/{ds_id}/{level}/{row}/{col}"
+    vmin = float(store.meta["vmin"])
+    vmax = float(store.meta["vmax"])
 
     def render() -> bytes:
-        block = _store.tile(level, row, col)
+        block = store.tile(level, row, col)
         return render_tile_png(block, vmin, vmax)
 
     return tile_cache.get_or_render(key, render)
 
 
-@app.get("/api/tile/{level}/{row}/{col}")
-async def get_tile(level: int, row: int, col: int):
+class TileRequest(BaseModel):
+    level: int
+    row: int
+    col: int
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/tile")
+async def get_tile(req: TileRequest):
     """Dynamic tile endpoint — renders from zarr on-the-fly, cached on disk.
 
+    Accepts JSON body: {"level": int, "row": int, "col": int, "dataset_id": str?}.
     Runs the (CPU-bound) render in a thread so the event loop stays responsive
     to the many parallel tile requests deck.gl issues.
     """
     try:
-        _store.open()
+        store = registry.get(req.dataset_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e))
     try:
-        png = await asyncio.to_thread(_serve_tile_sync, level, row, col)
+        png = await asyncio.to_thread(_serve_tile_sync, store, req.level, req.row, req.col)
     except (KeyError, IndexError):
         raise HTTPException(status_code=404, detail="tile out of range")
     return Response(content=png, media_type="image/png")
 
 
-@app.get("/api/obs")
-def get_obs():
+class ObsRequest(BaseModel):
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/obs")
+def get_obs(req: ObsRequest = ObsRequest()):
     """Return cell-level metadata (after pyramid reordering).
 
     For large datasets (>= ``OBS_FULL_THRESHOLD`` cells) this endpoint is
     disabled to prevent browser OOM; use ``/api/obs/range`` instead.
     """
-    _store.open()
-    n_cells = _store.meta.get("n_cells", 0)
+    store = registry.get(req.dataset_id)
+    n_cells = store.meta.get("n_cells", 0)
     if n_cells >= OBS_FULL_THRESHOLD:
         raise HTTPException(
             status_code=413,
             detail=(
                 f"Dataset has {n_cells} cells — /api/obs is disabled for datasets "
-                f"with >= {OBS_FULL_THRESHOLD} cells. Use /api/obs/range?start=&end= "
+                f"with >= {OBS_FULL_THRESHOLD} cells. Use /api/obs/range "
                 "to fetch metadata lazily."
             ),
         )
-    root = _store.root
+    root = store.root
     out = {"cell_ids": root["cell_ids"][:].tolist()}
     if "louvain" in root:
         out["louvain"] = root["louvain"][:].tolist()
@@ -208,8 +227,14 @@ def get_obs():
     return out
 
 
-@app.get("/api/obs/range")
-def get_obs_range(start: int = Query(0, ge=0), end: int = Query(..., ge=0)):
+class ObsRangeRequest(BaseModel):
+    start: int = 0
+    end: int
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/obs/range")
+def get_obs_range(req: ObsRangeRequest):
     """Return cell metadata for a half-open range [start, end).
 
     Used by the frontend for lazy axis-label fetching: only the cells visible
@@ -217,14 +242,15 @@ def get_obs_range(start: int = Query(0, ge=0), end: int = Query(..., ge=0)):
     even for 20M+ cell datasets.
     """
     try:
-        _store.open()
+        store = registry.get(req.dataset_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    root = _store.root
-    n_cells = _store.meta.get("n_cells", 0)
-    # Clamp the range to valid bounds.
-    start = max(0, start)
-    end = min(n_cells, end)
+    root = store.root
+    n_cells = store.meta.get("n_cells", 0)
+    start = max(0, req.start)
+    end = min(n_cells, req.end)
     if start >= end:
         return {"cell_ids": [], "start": start, "end": end}
     out: dict = {"cell_ids": root["cell_ids"][start:end].tolist(), "start": start, "end": end}
@@ -235,37 +261,57 @@ def get_obs_range(start: int = Query(0, ge=0), end: int = Query(..., ge=0)):
     return out
 
 
-@app.get("/api/groups")
-def get_groups():
+class GroupsRequest(BaseModel):
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/groups")
+def get_groups(req: GroupsRequest = GroupsRequest()):
     """Return the cluster groups (id + size) for the frontend SpatialLayout."""
-    _store.open()
-    return {"groups": _store.meta.get("groups", [])}
+    store = registry.get(req.dataset_id)
+    return {"groups": store.meta.get("groups", [])}
 
 
-@app.get("/api/var")
-def get_var():
-    _store.open()
-    return {"var_names": _store.root["var_names"][:].tolist()}
+class VarRequest(BaseModel):
+    dataset_id: Optional[str] = None
 
 
-@app.get("/api/value/{cell}/{gene}")
-def get_value(cell: int, gene: int):
+@app.post("/api/var")
+def get_var(req: VarRequest = VarRequest()):
+    store = registry.get(req.dataset_id)
+    return {"var_names": store.root["var_names"][:].tolist()}
+
+
+class ValueRequest(BaseModel):
+    cell: int
+    gene: int
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/value")
+def get_value(req: ValueRequest):
     """Return the raw expression value for a single cell-gene pair (level 0)."""
     try:
-        _store.open()
-        arr = _store.array(0)
+        store = registry.get(req.dataset_id)
+        arr = store.array(0)
         # Matrix is transposed: (n_genes, n_cells) -> [gene, cell].
         n_genes, n_cells = arr.shape
-        if not (0 <= cell < n_cells and 0 <= gene < n_genes):
+        if not (0 <= req.cell < n_cells and 0 <= req.gene < n_genes):
             raise HTTPException(status_code=404, detail="index out of range")
-        value = float(arr[gene, cell])
+        value = float(arr[req.gene, req.cell])
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return {"cell": cell, "gene": gene, "value": value}
+    return {"cell": req.cell, "gene": req.gene, "value": value}
 
 
-@app.get("/api/cell_order")
-def get_cell_order():
+class CellOrderRequest(BaseModel):
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/cell_order")
+def get_cell_order(req: CellOrderRequest = CellOrderRequest()):
     """Return the cluster permutation array (reordered cell indices).
 
     Stored as a chunked zarr int32 array; read in full here (it is only needed
@@ -273,19 +319,28 @@ def get_cell_order():
     For 20M cells this is ~80 MB — the frontend should request it lazily.
     """
     try:
-        _store.open()
+        store = registry.get(req.dataset_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    root = _store.root
+    root = store.root
     if "cell_order" not in root:
         raise HTTPException(status_code=404, detail="cell_order not stored")
     return {"cell_order": np.asarray(root["cell_order"][:]).tolist()}
 
 
-@app.get("/api/cache/stats")
-def get_cache_stats():
-    """Return tile cache statistics."""
-    return tile_cache.stats()
+class CacheStatsRequest(BaseModel):
+    dataset_id: Optional[str] = None
+
+
+@app.post("/api/cache/stats")
+def get_cache_stats(req: CacheStatsRequest = CacheStatsRequest()):
+    """Return tile cache + registry statistics."""
+    return {
+        "tile_cache": tile_cache.stats(),
+        "registry": registry.stats(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -301,19 +356,20 @@ class CustomPyramid:
     per-custom-pyramid zarr store on disk, and the pyramid levels are built
     via dask — keeping RAM bounded regardless of dataset size.
 
-    Entries expire after 30 minutes of inactivity to bound disk usage.
+    Custom pyramids are keyed by ``cid`` and are tied to a specific
+    ``dataset_id`` (the source heatmap). Entries expire after 30 minutes
+    of inactivity to bound disk usage.
     """
 
     def __init__(self):
+        # cid -> {"store": dict, "dataset_id": str, "last_access": float}
         self._stores: dict[str, dict] = {}
 
-    def _is_large(self) -> bool:
-        _store.open()
-        return _store.meta.get("n_cells", 0) >= OBS_FULL_THRESHOLD
+    def _is_large(self, store: PyramidStore) -> bool:
+        return store.meta.get("n_cells", 0) >= OBS_FULL_THRESHOLD
 
-    def build(self, gene_indices: list[int]) -> str:
-        _store.open()
-        arr0 = _store.array(0)
+    def build(self, base_store: PyramidStore, gene_indices: list[int]) -> str:
+        arr0 = base_store.array(0)
         n_genes_full, n_cells = arr0.shape
         idx = np.asarray(gene_indices, dtype=np.int64)
         if idx.size == 0:
@@ -322,21 +378,21 @@ class CustomPyramid:
             raise IndexError("gene index out of range")
         n_sel = len(idx)
 
-        if self._is_large():
-            return self._build_large(idx, n_sel, n_cells)
-        return self._build_small(idx, n_sel, n_cells)
+        if self._is_large(base_store):
+            return self._build_large(base_store, idx, n_sel, n_cells)
+        return self._build_small(base_store, idx, n_sel, n_cells)
 
-    def _build_small(self, idx: np.ndarray, n_sel: int, n_cells: int) -> str:
+    def _build_small(
+        self, base_store: PyramidStore, idx: np.ndarray, n_sel: int, n_cells: int
+    ) -> str:
         """In-memory build for small datasets (original behaviour)."""
-        arr0 = _store.array(0)
+        arr0 = base_store.array(0)
         sub = np.asarray(arr0[idx, :], dtype=np.float32)
         levels = [sub]
         h, w = sub.shape
         while h > TILE_SIZE or w > TILE_SIZE:
             h2 = (h // 2) * 2
             w2 = (w // 2) * 2
-            # When the gene (row) dimension is already ≤ 1, only coarsen
-            # the cell (column) dimension to avoid collapsing to 0 rows.
             if h <= 1:
                 h2 = h
                 coarse = sub[:h2, :w2].copy()
@@ -354,13 +410,14 @@ class CustomPyramid:
             sample = levels[0].ravel()
         vmin = float(np.percentile(sample, 1))
         vmax = float(np.percentile(sample, 99))
-        var_names = _store.root["var_names"][:][idx].tolist()
+        var_names = base_store.root["var_names"][:][idx].tolist()
         shapes = [[int(l.shape[0]), int(l.shape[1])] for l in levels]
         cid = uuid.uuid4().hex[:12]
         self._stores[cid] = {
             "levels": levels,
             "var_names": var_names,
             "zarr_path": None,
+            "dataset_id": base_store.dataset_id,
             "last_access": time.time(),
             "meta": {
                 "n_cells": int(n_cells),
@@ -370,28 +427,28 @@ class CustomPyramid:
                 "levels": shapes,
                 "vmin": vmin,
                 "vmax": vmax,
-                "layer": _store.meta.get("layer", "X"),
+                "layer": base_store.meta.get("layer", "X"),
                 "colormap": "viridis",
                 "gene_indices": idx.tolist(),
-                "groups": _store.meta.get("groups", [{"id": "0", "size": int(n_cells)}]),
+                "groups": base_store.meta.get("groups", [{"id": "0", "size": int(n_cells)}]),
             },
         }
         return cid
 
-    def _build_large(self, idx: np.ndarray, n_sel: int, n_cells: int) -> str:
+    def _build_large(
+        self, base_store: PyramidStore, idx: np.ndarray, n_sel: int, n_cells: int
+    ) -> str:
         """Out-of-core build for large datasets: stream selected gene rows
         from level 0 into a per-custom zarr store, then dask-pool the pyramid.
         """
         import dask.array as da
 
-        arr0 = _store.array(0)
+        arr0 = base_store.array(0)
         cid = uuid.uuid4().hex[:12]
-        custom_dir = ZARR_PATH.parent / f"custom_{cid}"
-        store = zarr.DirectoryStore(str(custom_dir))
-        root = zarr.group(store=store, overwrite=True)
+        custom_dir = base_store.zarr_path.parent / f"custom_{cid}"
+        zstore = zarr.DirectoryStore(str(custom_dir))
+        root = zarr.group(store=zstore, overwrite=True)
 
-        # Stream each selected gene row into a custom level_0 zarr array.
-        # Each gene row is n_cells * 4 bytes (80 MB at 20M) — fits RAM.
         custom_arr = root.zeros(
             "level_0",
             shape=(n_sel, n_cells),
@@ -402,9 +459,8 @@ class CustomPyramid:
         )
         for i, g in enumerate(idx):
             custom_arr[i, :] = np.asarray(arr0[g, :], dtype=np.float32)
-        var_names = _store.root["var_names"][:][idx].tolist()
+        var_names = base_store.root["var_names"][:][idx].tolist()
 
-        # Build pyramid levels via dask (out-of-core).
         current = da.from_zarr(custom_arr)
         levels_shapes = [list(current.shape)]
         level = 0
@@ -412,8 +468,6 @@ class CustomPyramid:
         while h > TILE_SIZE or w > TILE_SIZE:
             h2 = (h // 2) * 2
             w2 = (w // 2) * 2
-            # When the gene (row) dimension is already ≤ 1, only coarsen
-            # the cell (column) dimension to avoid collapsing to 0 rows.
             if h <= 1:
                 h2 = h
                 coarse = current[:h2, :w2].rechunk((TILE_SIZE, TILE_SIZE))
@@ -439,7 +493,6 @@ class CustomPyramid:
 
         n_levels = level + 1
 
-        # Approximate percentile from a sample of level 0.
         rng = np.random.default_rng(42)
         n_cell_chunks = (n_cells + TILE_SIZE - 1) // TILE_SIZE
         n_sample = min(2000, n_sel * n_cell_chunks)
@@ -464,6 +517,7 @@ class CustomPyramid:
         self._stores[cid] = {
             "levels": None,  # on-disk, opened lazily
             "zarr_path": custom_dir,
+            "dataset_id": base_store.dataset_id,
             "var_names": var_names,
             "last_access": time.time(),
             "meta": {
@@ -474,10 +528,10 @@ class CustomPyramid:
                 "levels": levels_shapes,
                 "vmin": vmin,
                 "vmax": vmax,
-                "layer": _store.meta.get("layer", "X"),
+                "layer": base_store.meta.get("layer", "X"),
                 "colormap": "viridis",
                 "gene_indices": idx.tolist(),
-                "groups": _store.meta.get("groups", [{"id": "0", "size": int(n_cells)}]),
+                "groups": base_store.meta.get("groups", [{"id": "0", "size": int(n_cells)}]),
             },
         }
         return cid
@@ -546,6 +600,7 @@ _custom = CustomPyramid()
 
 class GeneSelection(BaseModel):
     gene_indices: list[int]
+    dataset_id: Optional[str] = None
 
 
 @app.post("/api/custom")
@@ -553,18 +608,24 @@ def create_custom(selection: GeneSelection):
     """Build a custom sub-matrix pyramid for the given gene indices."""
     _custom._evict_expired()
     try:
-        _store.open()
-        cid = _custom.build(selection.gene_indices)
+        base_store = registry.get(selection.dataset_id)
+        cid = _custom.build(base_store, selection.gene_indices)
     except (ValueError, IndexError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"id": cid, **_custom.get(cid)["meta"]}
 
 
-@app.get("/api/custom/{cid}/meta")
-def get_custom_meta(cid: str):
-    store = _custom.get(cid)
+class CustomMetaRequest(BaseModel):
+    cid: str
+
+
+@app.post("/api/custom/meta")
+def get_custom_meta(req: CustomMetaRequest):
+    store = _custom.get(req.cid)
     if not store:
         raise HTTPException(status_code=404, detail="custom pyramid not found")
     return store["meta"]
@@ -585,8 +646,16 @@ def _serve_custom_tile_sync(cid: str, level: int, row: int, col: int) -> bytes:
     return tile_cache.get_or_render(key, render)
 
 
-@app.get("/api/custom/{cid}/tile/{level}/{row}/{col}")
-async def get_custom_tile(cid: str, level: int, row: int, col: int):
+class CustomTileRequest(BaseModel):
+    cid: str
+    level: int
+    row: int
+    col: int
+
+
+@app.post("/api/custom/tile")
+async def get_custom_tile(req: CustomTileRequest):
+    cid, level, row, col = req.cid, req.level, req.row, req.col
     store = _custom.get(cid)
     if not store:
         raise HTTPException(status_code=404, detail="custom pyramid not found")
@@ -597,9 +666,13 @@ async def get_custom_tile(cid: str, level: int, row: int, col: int):
     return Response(content=png, media_type="image/png")
 
 
-@app.get("/api/custom/{cid}/var")
-def get_custom_var(cid: str):
-    store = _custom.get(cid)
+class CustomVarRequest(BaseModel):
+    cid: str
+
+
+@app.post("/api/custom/var")
+def get_custom_var(req: CustomVarRequest):
+    store = _custom.get(req.cid)
     if not store:
         raise HTTPException(status_code=404, detail="custom pyramid not found")
     return {"var_names": store["var_names"]}

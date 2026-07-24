@@ -75,3 +75,22 @@ USE_DYNAMIC_TILES = os.environ.get("HEATMAP_STATIC_TILES", "0") != "1"
 # /api/obs/range endpoint. Prevents browser OOM for large datasets.
 # OBS_FULL_THRESHOLD = int(os.environ.get("HEATMAP_OBS_FULL_THRESHOLD", "1000000"))
 OBS_FULL_THRESHOLD = int(os.environ.get("HEATMAP_OBS_FULL_THRESHOLD", "100000"))
+
+# ---------------------------------------------------------------------------
+# PyramidRegistry settings (multi-heatmap support)
+# ---------------------------------------------------------------------------
+
+# Directory containing multiple zarr pyramid stores, one per dataset.
+# Each subdirectory matching the pattern "<dataset_id>.zarr" (or just a
+# subdirectory with a meta.json inside) is treated as a separate heatmap.
+# The default heatmap.zarr is registered as dataset_id "default".
+REGISTRY_DIR = Path(os.environ.get("HEATMAP_REGISTRY_DIR", DATA_DIR))
+
+# Maximum number of PyramidStore instances kept open simultaneously (LRU).
+# Each open store holds zarr array handles + cached metadata (~MB), so
+# limiting concurrent opens bounds server memory.
+REGISTRY_MAX_OPEN = int(os.environ.get("HEATMAP_REGISTRY_MAX_OPEN", "4"))
+
+# Idle TTL in seconds: a store not accessed for this long is closed (zarr
+# handles released) and eligible for LRU eviction. Default 30 minutes.
+REGISTRY_TTL = int(os.environ.get("HEATMAP_REGISTRY_TTL", "1800"))

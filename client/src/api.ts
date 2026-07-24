@@ -6,7 +6,7 @@ export interface GroupConfig {
   size: number;
 }
 
-/** Shape of the pyramid metadata returned by GET /api/meta. */
+/** Shape of the pyramid metadata returned by POST /api/meta. */
 export interface PyramidMeta {
   n_cells: number;
   n_genes: number;
@@ -22,8 +22,8 @@ export interface PyramidMeta {
   groups?: GroupConfig[];
 }
 
-/** Cell-level metadata returned by GET /api/obs (full, small datasets) or
- *  GET /api/obs/range (lazy, large datasets). */
+/** Cell-level metadata returned by POST /api/obs (full, small datasets) or
+ *  POST /api/obs/range (lazy, large datasets). */
 export interface ObsData {
   cell_ids: string[];
   louvain?: string[];
@@ -33,18 +33,55 @@ export interface ObsData {
   end?: number;
 }
 
+/** A discovered dataset (from POST /api/datasets). */
+export interface DatasetInfo {
+  id: string;
+  path: string;
+}
+
 const http = axios.create({
   baseURL: "/api",
   timeout: 30000,
 });
 
+/**
+ * The active dataset ID. All tile/metadata requests include this in the
+ * POST body so the backend's PyramidRegistry knows which zarr store to
+ * read from. Defaults to "default" (the legacy heatmap.zarr).
+ */
+let _datasetId: string | null = null;
+
+/** Set the active dataset ID (called when the user selects a heatmap). */
+export function setDatasetId(id: string | null): void {
+  _datasetId = id;
+}
+
+/** Get the active dataset ID (null = "default" on the backend). */
+export function getDatasetId(): string | null {
+  return _datasetId;
+}
+
+/** Build the request body, including dataset_id when set. */
+function _body(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return _datasetId ? { dataset_id: _datasetId, ...extra } : extra;
+}
+
+/** List all available heatmap datasets on the server. */
+export async function fetchDatasets(): Promise<{ datasets: DatasetInfo[] }> {
+  const { data } = await http.post<{ datasets: DatasetInfo[] }>(
+    "/datasets",
+    {},
+  );
+  return data;
+}
+
 export async function fetchMeta(): Promise<PyramidMeta> {
-  const { data } = await http.get<PyramidMeta>("/meta");
+  const { data } = await http.post<PyramidMeta>("/meta", _body());
   return data;
 }
 
 export async function fetchObs(): Promise<ObsData> {
-  const { data } = await http.get<ObsData>("/obs");
+  const { data } = await http.post<ObsData>("/obs", _body());
   return data;
 }
 
@@ -55,20 +92,24 @@ export async function fetchObsRange(
   start: number,
   end: number,
 ): Promise<ObsData> {
-  const { data } = await http.get<ObsData>("/obs/range", {
-    params: { start, end },
-  });
+  const { data } = await http.post<ObsData>(
+    "/obs/range",
+    _body({ start, end }),
+  );
   return data;
 }
 
 export async function fetchVar(): Promise<{ var_names: string[] }> {
-  const { data } = await http.get<{ var_names: string[] }>("/var");
+  const { data } = await http.post<{ var_names: string[] }>("/var", _body());
   return data;
 }
 
 /** Fetch the cluster groups (id + size) for the SpatialLayout. */
 export async function fetchGroups(): Promise<{ groups: GroupConfig[] }> {
-  const { data } = await http.get<{ groups: GroupConfig[] }>("/groups");
+  const { data } = await http.post<{ groups: GroupConfig[] }>(
+    "/groups",
+    _body(),
+  );
   return data;
 }
 
@@ -76,17 +117,18 @@ export async function fetchValue(
   cell: number,
   gene: number,
 ): Promise<{ cell: number; gene: number; value: number }> {
-  const { data } = await http.get(`/value/${cell}/${gene}`);
+  const { data } = await http.post(`/value`, _body({ cell, gene }));
   return data;
 }
 
 /**
- * Build the URL for a single tile PNG. For large datasets (>1M cells) we use
- * the dynamic zarr-backed endpoint (/api/tile/...) which renders tiles
- * on-the-fly and caches them on disk. For small datasets the static
- * pre-rendered path (/tiles/...) may be used (set HEATMAP_STATIC_TILES=1 on
- * the backend). Using a direct URL (not axios) lets deck.gl's BitmapLayer
- * manage image loading + caching efficiently.
+ * Fetch a single tile PNG via POST. Returns the raw PNG bytes as an
+ * ArrayBuffer so the TileLoader can create a blob URL for deck.gl.
+ *
+ * For large datasets (>1M cells) we use the dynamic zarr-backed endpoint
+ * (/api/tile) which renders tiles on-the-fly and caches them on disk.
+ * For small datasets the static pre-rendered path (/tiles/...) may be used
+ * (set HEATMAP_STATIC_TILES=1 on the backend).
  *
  * The dynamic flag is read from /api/meta once and cached here.
  */
@@ -97,11 +139,25 @@ export function setUseDynamicTiles(dynamic: boolean): void {
   _useDynamicTiles = dynamic;
 }
 
-export function tileUrl(level: number, row: number, col: number): string {
-  if (_useDynamicTiles) {
-    return `/api/tile/${level}/${row}/${col}`;
+/**
+ * POST a tile request and return the PNG as an ArrayBuffer.
+ * Used by TileLoader to create blob URLs for deck.gl BitmapLayer.
+ */
+export async function fetchTileArrayBuffer(
+  level: number,
+  row: number,
+  col: number,
+): Promise<ArrayBuffer> {
+  if (!_useDynamicTiles) {
+    // Static tiles: fall back to GET (legacy path).
+    const resp = await fetch(`/tiles/${level}/${row}_${col}.png`);
+    if (!resp.ok) throw new Error(`tile ${level}/${row}/${col} not found`);
+    return await resp.arrayBuffer();
   }
-  return `/tiles/${level}/${row}_${col}.png`;
+  const resp = await http.post("/tile", _body({ level, row, col }), {
+    responseType: "arraybuffer",
+  });
+  return resp.data as ArrayBuffer;
 }
 
 /* ------------------------------------------------------------------ */
@@ -121,6 +177,7 @@ export async function createCustomPyramid(
 ): Promise<CustomPyramidResponse> {
   const { data } = await http.post<CustomPyramidResponse>("/custom", {
     gene_indices: geneIndices,
+    dataset_id: _datasetId ?? undefined,
   });
   return data;
 }
@@ -129,18 +186,26 @@ export async function createCustomPyramid(
 export async function fetchCustomVar(
   cid: string,
 ): Promise<{ var_names: string[] }> {
-  const { data } = await http.get<{ var_names: string[] }>(
-    `/custom/${cid}/var`,
-  );
+  const { data } = await http.post<{ var_names: string[] }>("/custom/var", {
+    cid,
+  });
   return data;
 }
 
-/** Build the URL for a custom pyramid tile PNG (always dynamic). */
-export function customTileUrl(
+/**
+ * POST a custom pyramid tile request and return the PNG as an ArrayBuffer.
+ * Used by TileLoader to create blob URLs for deck.gl BitmapLayer.
+ */
+export async function fetchCustomTileArrayBuffer(
   cid: string,
   level: number,
   row: number,
   col: number,
-): string {
-  return `/api/custom/${cid}/tile/${level}/${row}/${col}`;
+): Promise<ArrayBuffer> {
+  const resp = await http.post(
+    "/custom/tile",
+    { cid, level, row, col },
+    { responseType: "arraybuffer" },
+  );
+  return resp.data as ArrayBuffer;
 }

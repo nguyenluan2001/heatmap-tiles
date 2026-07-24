@@ -440,6 +440,26 @@ body {
   cursor: pointer;
 }
 
+.dataset-select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 13px;
+  padding: 4px 8px;
+  cursor: pointer;
+  max-width: 220px;
+}
+
+.dataset-select:hover {
+  border-color: var(--accent);
+}
+
+.dataset-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .ctrl-value {
   color: var(--accent);
   font-variant-numeric: tabular-nums;
